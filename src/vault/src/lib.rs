@@ -126,6 +126,43 @@ impl VaultManager {
         g.state = VaultState::Locked;
         Ok(())
     }
+
+    /// Replace the in-memory MK with `new_mk`. Used by `rotate_master_key`
+    /// after the recovery service has re-wrapped the manifest.
+    pub fn replace_mk(&self, new_mk: [u8; 32]) -> Result<(), VaultError> {
+        let mut g = self.inner.write().expect("vault mgr");
+        if g.state != VaultState::Unlocked {
+            return Err(VaultError::BadState(g.state));
+        }
+        g.mk = Some(Zeroizing::new(new_mk));
+        Ok(())
+    }
+
+    /// Drive Unlocked → Destroying → Destroyed. Caller is responsible for
+    /// the residual sweep through the plugin host before calling this; we
+    /// just transition the state machine and zeroize the master key.
+    pub fn begin_destroying(&self) -> Result<(), VaultError> {
+        let mut g = self.inner.write().expect("vault mgr");
+        match g.state {
+            VaultState::Unlocked | VaultState::Locked => {
+                g.state = VaultState::Destroying;
+                g.mk = None;
+                Ok(())
+            }
+            other => Err(VaultError::BadState(other)),
+        }
+    }
+
+    pub fn finish_destroying(&self) -> Result<(), VaultError> {
+        let mut g = self.inner.write().expect("vault mgr");
+        if g.state != VaultState::Destroying {
+            return Err(VaultError::BadState(g.state));
+        }
+        g.state = VaultState::Destroyed;
+        g.vault_id = None;
+        g.binding = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

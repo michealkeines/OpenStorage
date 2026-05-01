@@ -1,13 +1,11 @@
-//! `os-plugin-http-backend` — `PluginContract` impl backed by an HTTP object
-//! store (the testbench in `testbench/server.py`, or any compatible service).
+//! `os-plugin-http-backend` — talks to the Python testbench (or any
+//! compatible HTTP object store).
 //!
-//! Routes used:
-//!   PUT  /v1/objects                → returns {handle, size, etag, stored_at}
-//!   GET  /v1/objects/{handle}       → bytes (Range supported)
-//!   HEAD /v1/objects/{handle}       → metadata
-//!   DELETE /v1/objects/{handle}     → outcome
-//!
-//! Uploads stream the request body so 1 GB shards don't sit in memory.
+//! Both the chunk-role (`PluginContract`) and vault-role
+//! (`VaultPluginContract`) implementations route HTTP through
+//! `os_plugin_host::http::HttpClient`. The default `RateLimitDetector` is
+//! enough — the testbench, like most HTTP object stores, signals 429 via
+//! the `Retry-After` header.
 
 #![forbid(unsafe_code)]
 
@@ -15,64 +13,33 @@ use async_trait::async_trait;
 use os_entities::{NativeHandle, PutHint};
 use os_plugin_host::{
     contract::{
-        DeleteResult, HealthReport, HealthState, PeekResult, PluginContract, PutResult,
+        CasOutcome, CasResult, DeleteResult, HealthReport, HealthState, ListEntry, PeekResult,
+        PluginContract, PutResult, VaultPluginContract,
     },
+    http::{HttpClient, HttpClientConfig},
     PluginError, Result as PluginResult,
 };
 use os_types::{
     BlakeHash, CachedElsewhereRisk, DeleteOutcome, HealthScore, LatencyProfile,
-    PriorHandleState, QuotaReclaimed, QuotaState, Range, RateLimitState, Timestamp,
+    QuotaReclaimed, QuotaState, Range, RateLimitState, Timestamp,
 };
 use serde::Deserialize;
-
-#[derive(Debug, thiserror::Error)]
-pub enum HttpBackendError {
-    #[error("http: {0}")]
-    Http(String),
-    #[error("status {status}: {body}")]
-    Status { status: u16, body: String },
-    #[error("decode: {0}")]
-    Decode(String),
-}
-
-impl From<reqwest::Error> for HttpBackendError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Http(e.to_string())
-    }
-}
-
-impl From<HttpBackendError> for PluginError {
-    fn from(e: HttpBackendError) -> Self {
-        match e {
-            HttpBackendError::Status { status: 404, .. } => {
-                PluginError::Plugin("not found".into())
-            }
-            HttpBackendError::Status { status, body } => {
-                PluginError::Unavailable(format!("http {status}: {body}"))
-            }
-            HttpBackendError::Http(s) | HttpBackendError::Decode(s) => PluginError::Plugin(s),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct HttpBackendPlugin {
     base: String,
-    client: reqwest::Client,
+    http: HttpClient,
 }
 
 impl HttpBackendPlugin {
     pub fn new(base_url: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            // No total timeout; uploads can take minutes for 1 GB. Per-request
-            // connect timeout is sane.
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("reqwest client builds");
+        let cfg = HttpClientConfig {
+            user_agent: "openstorage-http-backend/0.1".into(),
+            ..Default::default()
+        };
         Self {
             base: base_url.into().trim_end_matches('/').to_string(),
-            client,
+            http: HttpClient::new(cfg),
         }
     }
 
@@ -84,7 +51,9 @@ impl HttpBackendPlugin {
 #[derive(Deserialize)]
 struct PutRespJson {
     handle: String,
+    #[allow(dead_code)]
     size: u64,
+    #[allow(dead_code)]
     etag: String,
     stored_at: f64,
 }
@@ -96,29 +65,23 @@ impl PluginContract for HttpBackendPlugin {
         if let Some(prev) = &hint.replaces_handle {
             url.push_str(&format!("?replaces={}", encode_handle(prev)));
         }
-        let body = payload.to_vec();
         let resp = self
-            .client
-            .post(&url)
-            .body(body)
-            .send()
-            .await
-            .map_err(HttpBackendError::from)?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(HttpBackendError::Status {
-                status: status.as_u16(),
-                body,
-            }
-            .into());
-        }
-        let parsed: PutRespJson = resp.json().await.map_err(HttpBackendError::from)?;
-        let handle = NativeHandle(parsed.handle.into_bytes());
+            .http
+            .execute(os_plugin_host::http::HttpRequest {
+                method: reqwest::Method::POST,
+                url,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Some(os_plugin_host::http::client::Body::Bytes(payload.to_vec())),
+            })
+            .await?;
+        let parsed: PutRespJson = resp.json()?;
         Ok(PutResult {
-            handle,
+            handle: NativeHandle(parsed.handle.into_bytes()),
             handle_changed: true,
-            prior_handle_state: hint.replaces_handle.as_ref().map(|_| PriorHandleState::Removed),
+            prior_handle_state: hint
+                .replaces_handle
+                .as_ref()
+                .map(|_| os_types::PriorHandleState::Removed),
             stored_at: ts_from_unix(parsed.stored_at as i64),
             quota_reclaimed: QuotaReclaimed::Unknown,
             tombstone_clears_at: None,
@@ -130,128 +93,80 @@ impl PluginContract for HttpBackendPlugin {
         handle: &NativeHandle,
         range: Option<Range>,
     ) -> PluginResult<Vec<u8>> {
-        let mut req = self.client.get(self.url(&format!(
-            "/v1/objects/{}",
-            encode_handle(handle)
-        )));
-        if let Some(r) = range {
-            req = req.header(
-                "Range",
-                format!("bytes={}-{}", r.start, r.end.saturating_sub(1)),
-            );
-        }
-        let resp = req.send().await.map_err(HttpBackendError::from)?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(HttpBackendError::Status {
-                status: status.as_u16(),
-                body,
-            }
-            .into());
-        }
-        let bytes = resp.bytes().await.map_err(HttpBackendError::from)?;
-        Ok(bytes.to_vec())
+        let url = self.url(&format!("/v1/objects/{}", encode_handle(handle)));
+        Ok(self.http.get(&url, range).await?.to_vec())
     }
 
     async fn peek(&self, handle: &NativeHandle) -> PluginResult<PeekResult> {
-        let resp = self
-            .client
-            .head(self.url(&format!("/v1/objects/{}", encode_handle(handle))))
-            .send()
-            .await
-            .map_err(HttpBackendError::from)?;
-        if resp.status().as_u16() == 404 {
-            return Ok(PeekResult {
+        let url = self.url(&format!("/v1/objects/{}", encode_handle(handle)));
+        match self.http.head(&url).await {
+            Ok(resp) => {
+                let size = resp
+                    .header_str("content-length")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let mtime = resp
+                    .header_str("x-stored-at")
+                    .and_then(|s| s.parse().ok())
+                    .map(ts_from_unix)
+                    .unwrap_or_else(|| ts_from_unix(0));
+                let etag = resp
+                    .header_str("etag")
+                    .and_then(|s| hex::decode(s).ok())
+                    .and_then(|v| {
+                        if v.len() == 32 {
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&v);
+                            Some(BlakeHash::from_bytes(a))
+                        } else {
+                            None
+                        }
+                    });
+                Ok(PeekResult {
+                    exists: true,
+                    size,
+                    mtime,
+                    etag,
+                })
+            }
+            Err(PluginError::Plugin(msg)) if msg.contains("not found") => Ok(PeekResult {
                 exists: false,
                 size: 0,
                 mtime: ts_from_unix(0),
                 etag: None,
-            });
+            }),
+            Err(e) => Err(e),
         }
-        if !resp.status().is_success() {
-            return Err(HttpBackendError::Status {
-                status: resp.status().as_u16(),
-                body: String::new(),
-            }
-            .into());
-        }
-        let size = resp
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let mtime = resp
-            .headers()
-            .get("x-stored-at")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(ts_from_unix)
-            .unwrap_or_else(|| ts_from_unix(0));
-        let etag = resp
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| hex::decode(s).ok())
-            .and_then(|v| {
-                if v.len() == 32 {
-                    let mut a = [0u8; 32];
-                    a.copy_from_slice(&v);
-                    Some(BlakeHash::from_bytes(a))
-                } else {
-                    None
-                }
-            });
-        Ok(PeekResult {
-            exists: true,
-            size,
-            mtime,
-            etag,
-        })
     }
 
     async fn delete(&self, handle: &NativeHandle) -> PluginResult<DeleteResult> {
-        let resp = self
-            .client
-            .delete(self.url(&format!("/v1/objects/{}", encode_handle(handle))))
-            .send()
-            .await
-            .map_err(HttpBackendError::from)?;
-        let outcome = match resp.status().as_u16() {
-            200 => DeleteOutcome::Removed,
-            404 => DeleteOutcome::NotFound,
-            other => {
-                return Err(HttpBackendError::Status {
-                    status: other,
-                    body: String::new(),
-                }
-                .into())
-            }
-        };
-        Ok(DeleteResult {
-            outcome,
-            quota_reclaimed: if outcome == DeleteOutcome::Removed {
-                QuotaReclaimed::Yes
-            } else {
-                QuotaReclaimed::No
-            },
-            cached_elsewhere_risk: CachedElsewhereRisk::Low,
-            tombstone_clears_at: None,
-        })
+        let url = self.url(&format!("/v1/objects/{}", encode_handle(handle)));
+        match self.http.delete(&url).await {
+            Ok(_) => Ok(DeleteResult {
+                outcome: DeleteOutcome::Removed,
+                quota_reclaimed: QuotaReclaimed::Yes,
+                cached_elsewhere_risk: CachedElsewhereRisk::Low,
+                tombstone_clears_at: None,
+            }),
+            Err(PluginError::Plugin(m)) if m.contains("not found") => Ok(DeleteResult {
+                outcome: DeleteOutcome::NotFound,
+                quota_reclaimed: QuotaReclaimed::No,
+                cached_elsewhere_risk: CachedElsewhereRisk::Low,
+                tombstone_clears_at: None,
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     async fn health(&self) -> PluginResult<HealthReport> {
-        let resp = self
-            .client
-            .get(self.url("/v1/health"))
-            .send()
-            .await
-            .map_err(HttpBackendError::from)?;
-        let state = if resp.status().is_success() {
-            HealthState::Healthy
-        } else {
-            HealthState::Unhealthy
+        let state = match self.http.execute(os_plugin_host::http::HttpRequest {
+            method: reqwest::Method::GET,
+            url: self.url("/v1/health"),
+            headers: reqwest::header::HeaderMap::new(),
+            body: None,
+        }).await {
+            Ok(_) => HealthState::Healthy,
+            _ => HealthState::Unhealthy,
         };
         Ok(HealthReport {
             state,
@@ -262,7 +177,7 @@ impl PluginContract for HttpBackendPlugin {
             },
             rate_limit: RateLimitState {
                 remaining: u32::MAX,
-                reset_at: ts_from_unix(0),
+                reset_at: Timestamp::from_string("n/a"),
             },
             latency: LatencyProfile::default(),
             score: if state == HealthState::Healthy {
@@ -274,9 +189,130 @@ impl PluginContract for HttpBackendPlugin {
     }
 }
 
+#[async_trait]
+impl VaultPluginContract for HttpBackendPlugin {
+    async fn list(
+        &self,
+        prefix: &str,
+        limit: u32,
+        cursor: Option<Vec<u8>>,
+    ) -> PluginResult<(Vec<ListEntry>, Option<Vec<u8>>)> {
+        let mut url = self.url(&format!("/v1/named?prefix={prefix}&limit={limit}"));
+        if let Some(c) = &cursor {
+            url.push_str("&cursor=");
+            url.push_str(&urlencode(std::str::from_utf8(c).unwrap_or_default()));
+        }
+        let resp = self
+            .http
+            .execute(os_plugin_host::http::HttpRequest {
+                method: reqwest::Method::GET,
+                url,
+                headers: reqwest::header::HeaderMap::new(),
+                body: None,
+            })
+            .await?;
+        let parsed: serde_json::Value = resp.json()?;
+        let mut entries = Vec::new();
+        if let Some(arr) = parsed["entries"].as_array() {
+            for e in arr {
+                let name = e["name"].as_str().unwrap_or_default().to_string();
+                let size = e["size"].as_u64().unwrap_or(0);
+                let etag = e["etag"]
+                    .as_str()
+                    .and_then(|s| hex::decode(s).ok())
+                    .and_then(|v| {
+                        if v.len() == 32 {
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&v);
+                            Some(BlakeHash::from_bytes(a))
+                        } else {
+                            None
+                        }
+                    });
+                let mtime = e["mtime"]
+                    .as_i64()
+                    .map(ts_from_unix)
+                    .unwrap_or_else(|| ts_from_unix(0));
+                entries.push(ListEntry {
+                    name,
+                    size,
+                    etag,
+                    mtime,
+                });
+            }
+        }
+        let next_cursor = parsed["next_cursor"]
+            .as_str()
+            .map(|s| s.as_bytes().to_vec());
+        Ok((entries, next_cursor))
+    }
+
+    async fn cas_write(
+        &self,
+        name: &str,
+        payload: &[u8],
+        expected_etag: Option<BlakeHash>,
+    ) -> PluginResult<CasResult> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(et) = expected_etag {
+            headers.insert(
+                "if-match",
+                reqwest::header::HeaderValue::from_str(&hex::encode(et.as_bytes())).unwrap(),
+            );
+        }
+        let url = self.url(&format!("/v1/named/{}", urlencode(name)));
+        let resp = self
+            .http
+            .execute(os_plugin_host::http::HttpRequest {
+                method: reqwest::Method::PUT,
+                url,
+                headers,
+                body: Some(os_plugin_host::http::client::Body::Bytes(payload.to_vec())),
+            })
+            .await;
+        match resp {
+            Ok(r) => {
+                let body: serde_json::Value = r.json()?;
+                let new_etag = body["new_etag"]
+                    .as_str()
+                    .and_then(|s| hex::decode(s).ok())
+                    .and_then(|v| {
+                        if v.len() == 32 {
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&v);
+                            Some(BlakeHash::from_bytes(a))
+                        } else {
+                            None
+                        }
+                    });
+                Ok(CasResult {
+                    outcome: CasOutcome::Written,
+                    new_etag,
+                })
+            }
+            Err(PluginError::Plugin(m)) if m.contains("client error 412") => Ok(CasResult {
+                outcome: CasOutcome::EtagMismatch,
+                new_etag: None,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(*b as char)
+            }
+            other => out.push_str(&format!("%{:02X}", other)),
+        }
+    }
+    out
+}
+
 fn encode_handle(h: &NativeHandle) -> String {
-    // Our testbench treats the handle as a UTF-8 hex string. Plugins are free
-    // to use any bytes, but for this backend we keep it human-readable.
     String::from_utf8(h.0.clone()).unwrap_or_else(|_| hex::encode(&h.0))
 }
 
@@ -286,10 +322,6 @@ fn ts_from_unix(secs: i64) -> Timestamp {
 
 #[cfg(test)]
 mod tests {
-    // The tests under this module require the Python testbench to be running
-    // on `127.0.0.1:9090`. They are gated behind the `--ignored` flag so they
-    // don't break a default `cargo test` run; the engine's integration test
-    // (added later) launches the testbench itself.
     use super::*;
 
     fn handle_from_str(s: &str) -> NativeHandle {
@@ -304,6 +336,6 @@ mod tests {
         let bytes = p.get(&r.handle, None).await.unwrap();
         assert_eq!(bytes, b"hello plugin");
         let _ = p.delete(&r.handle).await.unwrap();
-        let _ = handle_from_str("ignored"); // suppress unused warning
+        let _ = handle_from_str("ignored");
     }
 }

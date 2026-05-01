@@ -25,6 +25,15 @@ os-identity = { workspace = true }
 os-recovery = { workspace = true }
 os-plugin-host = { workspace = true }
 os-plugin-http-backend = { workspace = true }
+os-plugin-fault-inject = { workspace = true }
+os-plugin-zeroxst = { workspace = true }
+os-plugin-telegram = { workspace = true }
+os-plugin-discord = { workspace = true }
+ciborium = { workspace = true }
+serde_json = { workspace = true }
+os-lease = { workspace = true }
+os-repair = { workspace = true }
+os-events = { workspace = true }
 os-entities = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }

@@ -16,7 +16,7 @@ your own redundancy. **Forever.**
 
 ```
             ┌───────────────────────────────────────┐
-            │           os (CLI / FUSE / GUI)       │
+            │              os (CLI)                 │
             └─────────────────┬─────────────────────┘
                               │   plaintext, briefly
    ┌──────────────────────────▼─────────────────────────────┐
@@ -24,14 +24,32 @@ your own redundancy. **Forever.**
    │  ─ HKDF / Argon2id / Ed25519 / ChaCha20-Poly1305 / EC   │
    │  ─ CRDT log + HLC + signed snapshots                    │
    │  ─ chunk-level dedup + erasure coding                   │
-   └────┬─────────────┬─────────────┬───────────────┬────────┘
-        │ ciphertext  │ ciphertext  │ ciphertext    │ ciphertext
-        ▼             ▼             ▼               ▼
-   ┌────────┐    ┌─────────┐  ┌───────────┐  ┌─────────────────┐
-   │ Drive  │    │ Dropbox │  │ S3 / R2   │  │ python testbench│
-   │ plugin │    │ plugin  │  │ plugin    │  │ (this repo)     │
-   └────────┘    └─────────┘  └───────────┘  └─────────────────┘
+   └─┬────────┬───────────┬─────────┬───────────┬───────────┬┘
+     │ ciph   │ ciph      │ ciph    │ ciph      │ ciph      │ ciph
+     ▼        ▼           ▼         ▼           ▼           ▼
+  Telegram  Discord    uguu.se   Testbench   Local-dir   ⟨any⟩
+   (Bot)   (webhook)  (anon)    (Python)    (filesystem) plugin
 ```
+
+Backends are interchangeable. They share **one** trait — `PluginContract` —
+and the engine doesn't care whether the bytes go to a chat room or an S3
+bucket. The plugins shipped today:
+
+| Plugin | Auth | Limit | Use case |
+|---|---|---|---|
+| `http_backend` (Python testbench) | none | unlimited | local dev, CI, the comments-box demo |
+| `local_dir` | none | disk | embedded / FUSE mode |
+| `zerox_st` (uguu.se) | none | 128 MiB | anonymous public host |
+| `telegram` | bot token | 50 MiB | personal bot chat as durable storage |
+| `discord` | webhook URL | 25 MiB | server channel as durable storage |
+| `fault_inject` | n/a | n/a | wraps any plugin for failure injection |
+
+WhatsApp is **not** shipped. The only public WhatsApp API
+("WhatsApp Business Cloud") requires a Meta Business Manager account,
+verified phone number, and template-message approvals — there is no
+end-user, account-less path. `whatsapp-web.js` works but needs a browser
+session, not a backend daemon. If Meta opens a real personal-use API,
+adding it is ~150 lines of `PluginContract` against this repo.
 
 ---
 
@@ -52,6 +70,10 @@ column in the table below has tests behind it; the smoke scripts under
 | Pluggable backends via `PluginContract` | ✅ working |
 | HTTP-backend plugin (talks to any compatible object store) | ✅ working |
 | Local-directory plugin (filesystem-as-backend) | ✅ working |
+| Public-host plugin (uguu.se, anonymous) — 10 MiB live test passes | ✅ working |
+| Telegram Bot plugin — `sendDocument` + `getFile` + `deleteMessage` | ✅ working (live test gated by env vars) |
+| Discord webhook plugin — multipart POST + CDN GET + `DELETE /messages/{id}` | ✅ working (live test gated by env vars) |
+| Fault-injection plugin (wraps any backend for chunk-state testing) | ✅ working |
 | Streaming PUT/GET (1 GB without buffering in RAM) | ✅ working |
 | HTTP API (axum) — vaults, files, status, list | ✅ working |
 | CLI (`os init / upload / download / ls / lock / unlock`) | ✅ working |

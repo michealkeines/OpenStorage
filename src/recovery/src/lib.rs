@@ -232,6 +232,200 @@ impl RecoveryService {
         self.vault.set_unlocked(vault_id, mk_bytes)?;
         Ok(())
     }
+
+    /// Rotate the master key. Re-derives MK from the new passphrase, re-wraps
+    /// the manifest's check-blob, persists, and replaces the in-memory MK.
+    pub fn rotate_master_key(
+        &self,
+        vault_id: VaultId,
+        new_passphrase: &[u8],
+    ) -> Result<(), RecoveryError> {
+        if self.vault.state() != os_vault::VaultState::Unlocked {
+            return Err(RecoveryError::Vault("vault must be Unlocked".into()));
+        }
+        let backend = self.store.backend();
+        let manifest_bytes = backend
+            .get(os_metadata::ColumnFamily::VaultMeta, &manifest_key(vault_id))
+            .map_err(|e| RecoveryError::Metadata(e.to_string()))?
+            .ok_or(RecoveryError::VaultNotFound(vault_id))?;
+        let mut manifest: RecoveryManifest = decode_cbor(&manifest_bytes)?;
+
+        let new_kdf = test_or_default_kdf_params();
+        let new_mk = derive_master_key(new_passphrase, &new_kdf)?;
+        // Re-wrap check blob.
+        let nonce = random_nonce_12();
+        let (wrapped, tag) =
+            aead_encrypt(AeadSuite::ChaCha20Poly1305, &new_mk, &nonce, b"OK", CHECK_BLOB_AAD)?;
+        let new_token = RecoveryTokenId::new_v7();
+        if let Some(wmk) = manifest.wrapped_master_keys.first_mut() {
+            wmk.recovery_token_id = new_token;
+            wmk.wrapped = wrapped;
+            wmk.nonce = nonce;
+            wmk.tag = tag;
+        } else {
+            manifest.wrapped_master_keys.push(WrappedMasterKey {
+                mode_index: 0,
+                recovery_token_id: new_token,
+                wrapped,
+                nonce,
+                tag,
+            });
+        }
+        manifest.version_counter = MonotonicCounter(manifest.version_counter.0 + 1);
+        // Token rotation: revoke old, add new.
+        let old_ids: Vec<RecoveryTokenId> = manifest
+            .recovery_token_active_set
+            .live_values()
+            .copied()
+            .collect();
+        let old_add_ids: Vec<u128> = manifest
+            .recovery_token_active_set
+            .adds
+            .keys()
+            .copied()
+            .collect();
+        let _ = old_ids;
+        manifest
+            .recovery_token_active_set
+            .remove(old_add_ids);
+        manifest
+            .recovery_token_active_set
+            .add(new_token.as_uuid().as_u128(), new_token);
+
+        let mut txn = Txn::new();
+        txn.put(
+            os_metadata::ColumnFamily::VaultMeta,
+            manifest_key(vault_id),
+            encode_cbor(&manifest)?,
+        );
+        txn.put(
+            os_metadata::ColumnFamily::VaultMeta,
+            kdf_key(vault_id),
+            encode_cbor(&new_kdf)?,
+        );
+        self.store.commit(txn)?;
+
+        let mut mk_bytes = [0u8; 32];
+        mk_bytes.copy_from_slice(new_mk.as_bytes());
+        self.vault.replace_mk(mk_bytes)?;
+        Ok(())
+    }
+
+    /// Rotate the active set of recovery tokens without changing MK.
+    /// Returns the new token id.
+    pub fn rotate_recovery_token(
+        &self,
+        vault_id: VaultId,
+    ) -> Result<RecoveryTokenId, RecoveryError> {
+        if self.vault.state() != os_vault::VaultState::Unlocked {
+            return Err(RecoveryError::Vault("vault must be Unlocked".into()));
+        }
+        let backend = self.store.backend();
+        let manifest_bytes = backend
+            .get(os_metadata::ColumnFamily::VaultMeta, &manifest_key(vault_id))
+            .map_err(|e| RecoveryError::Metadata(e.to_string()))?
+            .ok_or(RecoveryError::VaultNotFound(vault_id))?;
+        let mut manifest: RecoveryManifest = decode_cbor(&manifest_bytes)?;
+        let old_add_ids: Vec<u128> = manifest
+            .recovery_token_active_set
+            .adds
+            .keys()
+            .copied()
+            .collect();
+        manifest.recovery_token_active_set.remove(old_add_ids);
+        let new_token = RecoveryTokenId::new_v7();
+        manifest
+            .recovery_token_active_set
+            .add(new_token.as_uuid().as_u128(), new_token);
+        manifest.version_counter = MonotonicCounter(manifest.version_counter.0 + 1);
+        let mut txn = Txn::new();
+        txn.put(
+            os_metadata::ColumnFamily::VaultMeta,
+            manifest_key(vault_id),
+            encode_cbor(&manifest)?,
+        );
+        self.store.commit(txn)?;
+        Ok(new_token)
+    }
+
+    /// Destroy the vault. Sweeps registered shards via the plugin host (best
+    /// effort), zeroizes MK, transitions Unlocked → Destroying → Destroyed.
+    pub async fn destroy_vault(&self, vault_id: VaultId) -> Result<DestroyReport, RecoveryError> {
+        let cur = self
+            .vault
+            .vault_id()
+            .ok_or(RecoveryError::VaultNotFound(vault_id))?;
+        if cur != vault_id {
+            return Err(RecoveryError::VaultNotFound(vault_id));
+        }
+        self.vault
+            .begin_destroying()
+            .map_err(|e| RecoveryError::Vault(e.to_string()))?;
+        let mut report = DestroyReport::default();
+
+        // Sweep shards: for each Shard record, ask its plugin to delete.
+        let backend = self.store.backend();
+        let shards_iter = backend
+            .scan_prefix(os_metadata::ColumnFamily::Shards, b"")
+            .map_err(|e| RecoveryError::Metadata(e.to_string()))?;
+        for kv in shards_iter {
+            let (_k, v) = kv.map_err(|e| RecoveryError::Metadata(e.to_string()))?;
+            let shard: os_entities::Shard = decode_cbor(&v)?;
+            let provider_id = shard.driver_id.value;
+            let plugin = match self.vault.plugin_host().get_chunk(provider_id) {
+                Ok(p) => p,
+                Err(_) => {
+                    report.unknown_shards += 1;
+                    continue;
+                }
+            };
+            let handle = shard.native_handle.value.clone();
+            match plugin.delete(&handle).await {
+                Ok(_) => report.removed_shards += 1,
+                Err(_) => report.failed_shards += 1,
+            }
+        }
+
+        // Wipe metadata records (files, chunks, shards, manifest, kdf).
+        let mut txn = Txn::new();
+        for cf in [
+            os_metadata::ColumnFamily::Files,
+            os_metadata::ColumnFamily::Chunks,
+            os_metadata::ColumnFamily::Shards,
+            os_metadata::ColumnFamily::Shadows,
+        ] {
+            for kv in backend
+                .scan_prefix(cf, b"")
+                .map_err(|e| RecoveryError::Metadata(e.to_string()))?
+            {
+                let (k, _v) = kv.map_err(|e| RecoveryError::Metadata(e.to_string()))?;
+                txn.delete(cf, k);
+            }
+        }
+        txn.delete(
+            os_metadata::ColumnFamily::VaultMeta,
+            manifest_key(vault_id),
+        );
+        txn.delete(os_metadata::ColumnFamily::VaultMeta, kdf_key(vault_id));
+        // Vault entity itself.
+        txn.delete(
+            os_metadata::ColumnFamily::VaultMeta,
+            vault_id.as_uuid().as_bytes().to_vec(),
+        );
+        self.store.commit(txn)?;
+
+        self.vault
+            .finish_destroying()
+            .map_err(|e| RecoveryError::Vault(e.to_string()))?;
+        Ok(report)
+    }
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct DestroyReport {
+    pub removed_shards: u64,
+    pub failed_shards: u64,
+    pub unknown_shards: u64,
 }
 
 fn manifest_key(v: VaultId) -> Vec<u8> {

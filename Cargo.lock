@@ -1324,6 +1324,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1372,21 +1382,30 @@ name = "openstorage"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ciborium",
  "hex",
  "os-api",
  "os-crypto",
  "os-entities",
+ "os-events",
  "os-identity",
+ "os-lease",
  "os-metadata",
+ "os-plugin-discord",
+ "os-plugin-fault-inject",
  "os-plugin-host",
  "os-plugin-http-backend",
+ "os-plugin-telegram",
+ "os-plugin-zeroxst",
  "os-recovery",
+ "os-repair",
  "os-sync",
  "os-types",
  "os-vault",
  "os-vfs",
  "os-wal",
  "rand 0.8.6",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1437,15 +1456,20 @@ name = "os-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
  "bytes",
+ "ciborium",
  "futures",
+ "hex",
  "os-crypto",
  "os-entities",
  "os-events",
  "os-identity",
+ "os-lease",
  "os-metadata",
  "os-plugin-host",
  "os-recovery",
+ "os-repair",
  "os-share",
  "os-sync",
  "os-types",
@@ -1614,6 +1638,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-plugin-discord"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "os-plugin-fault-inject"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "os-plugin-host"
 version = "0.1.0"
 dependencies = [
@@ -1626,8 +1675,12 @@ dependencies = [
  "os-metadata",
  "os-types",
  "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1636,19 +1689,41 @@ name = "os-plugin-http-backend"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
- "futures",
  "hex",
- "os-crypto",
  "os-entities",
  "os-plugin-host",
  "os-types",
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "os-plugin-telegram"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "os-plugin-zeroxst"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -2152,6 +2227,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -2732,6 +2808,12 @@ name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

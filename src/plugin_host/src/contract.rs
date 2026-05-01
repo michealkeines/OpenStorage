@@ -66,6 +66,19 @@ pub trait PluginContract: Send + Sync {
     async fn peek(&self, handle: &NativeHandle) -> Result<PeekResult>;
     async fn delete(&self, handle: &NativeHandle) -> Result<DeleteResult>;
     async fn health(&self) -> Result<HealthReport>;
+
+    /// **Self-described rate-limit profile.** The plugin tells the host
+    /// everything it knows about its backend's limits — per-op rates,
+    /// concurrency, max object size, total quota, and how to recognize a
+    /// 429 on the wire — in one declaration. The host reads this once at
+    /// registration and wires the rate-limit middleware automatically. New
+    /// plugins do not need to know about middleware config; they just say
+    /// what their backend is.
+    ///
+    /// Default = unbounded (suitable for filesystem / in-memory plugins).
+    fn rate_limit_profile(&self) -> crate::rate_limit::RateLimitProfile {
+        crate::rate_limit::RateLimitProfile::unbounded()
+    }
 }
 
 #[async_trait]

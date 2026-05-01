@@ -17,9 +17,14 @@ use os_crypto::generate_keypair;
 use os_entities::Provider;
 use os_identity::IdentityService;
 use os_metadata::backend::MemoryBackend;
-use os_metadata::{Store, Txn};
+use os_metadata::{ColumnFamily, Store, Txn};
 use os_plugin_host::Host;
 use os_plugin_http_backend::HttpBackendPlugin;
+use os_plugin_fault_inject::FaultInjectPlugin;
+use os_plugin_zeroxst::ZeroxStPlugin;
+use os_plugin_telegram::TelegramPlugin;
+use os_plugin_discord::DiscordPlugin;
+use os_plugin_host::contract::PluginContract;
 use os_recovery::RecoveryService;
 use os_sync::SyncEngine;
 use os_types::{
@@ -49,11 +54,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(Store::new(Arc::new(MemoryBackend::new())));
     let host = Arc::new(Host::new());
 
-    // Register one HTTP-backend chunk plugin pointed at the testbench.
+    // Pick the chunk backend. Defaults to the local testbench; flip to
+    // `OPENSTORAGE_BACKEND=zeroxst` to send ciphertext to the public 0x0.st
+    // anonymous file host. Fault-injection wraps both so the API can drive
+    // Healthy / Degraded transitions either way.
+    let backend_kind = std::env::var("OPENSTORAGE_BACKEND")
+        .unwrap_or_else(|_| "testbench".into());
     let provider_id = ProviderId::new_v7();
-    let plugin = Arc::new(HttpBackendPlugin::new(testbench_url.clone()));
-    host.register_chunk(provider_id, plugin);
-    persist_provider(&store, provider_id)?;
+    let (inner_plugin, plugin_id_str, trust_group, label, backend_label):
+        (Arc<dyn PluginContract>, &'static str, &'static str, &'static str, String) =
+        match backend_kind.as_str() {
+            "zeroxst" => (
+                Arc::new(ZeroxStPlugin::new()),
+                "org.openstorage.zeroxst",
+                "uguu.se",
+                "uguu.se-public",
+                "https://uguu.se (public, anonymous)".to_string(),
+            ),
+            "telegram" => {
+                let p = TelegramPlugin::from_env()
+                    .expect("TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID required for backend=telegram");
+                (
+                    Arc::new(p),
+                    "org.openstorage.telegram",
+                    "telegram",
+                    "telegram-bot",
+                    "https://api.telegram.org (Bot API)".to_string(),
+                )
+            }
+            "discord" => {
+                let p = DiscordPlugin::from_env()
+                    .expect("DISCORD_WEBHOOK_URL required for backend=discord");
+                (
+                    Arc::new(p),
+                    "org.openstorage.discord",
+                    "discord",
+                    "discord-webhook",
+                    "https://discord.com (webhook)".to_string(),
+                )
+            }
+            _ => (
+                Arc::new(HttpBackendPlugin::new(testbench_url.clone())),
+                "org.openstorage.http_backend",
+                "testbench",
+                "testbench",
+                testbench_url.clone(),
+            ),
+        };
+    let fault_plugin = Arc::new(FaultInjectPlugin::new(inner_plugin));
+    let fault_handle = fault_plugin.handle();
+    // Host reads `plugin.rate_limit_profile()` and wires the middleware
+    // automatically. No per-backend `RateLimitConfig` switch — the plugin
+    // is the source of truth for its own backend's limits.
+    host.register_chunk(provider_id, fault_plugin);
+    persist_provider(&store, provider_id, plugin_id_str, label, trust_group)?;
+
+    // Also register a vault-provider role so the engine has somewhere to push
+    // snapshots. The testbench's `HttpBackendPlugin` implements
+    // `VaultPluginContract` (list / cas_write); the public-host
+    // `ZeroxStPlugin` does not, so vault-role registration is testbench-only.
+    let vault_provider_id = ProviderId::new_v7();
+    if backend_kind == "testbench" || backend_kind.is_empty() {
+        let vp = Arc::new(HttpBackendPlugin::new(testbench_url.clone()));
+        host.register_vault(vault_provider_id, vp);
+        tracing::info!(provider_id = %vault_provider_id, "registered vault provider on testbench");
+    } else {
+        tracing::info!(
+            backend = %backend_kind,
+            "skipping vault-provider role: backend does not implement VaultPluginContract"
+        );
+    }
 
     let identity = Arc::new(IdentityService::new(store.clone()));
     let vault = Arc::new(VaultManager::new(store.clone(), host.clone()));
@@ -66,26 +136,142 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .path(data_dir.join("wal.bin"))
         .build(device_id, sk)?;
     let sync = Arc::new(SyncEngine::new(Arc::new(wal)));
-    let recovery = Arc::new(RecoveryService::new(store.clone(), identity, vault.clone()));
+    let recovery = Arc::new(RecoveryService::new(
+        store.clone(),
+        identity.clone(),
+        vault.clone(),
+    ));
     let vfs = Arc::new(VfsService::with_host(
-        store,
+        store.clone(),
         vault.clone(),
         sync,
-        host,
+        host.clone(),
         os_vfs::VfsConfig::default(),
     ));
+    let lease = Arc::new(os_lease::LeaseService::new());
+    let repair = Arc::new(os_repair::RepairScheduler::new(4096));
+    let events = Arc::new(os_events::EventBus::new());
+
+    // Repair worker: drains the scheduler. Currently handles GcSweep tasks
+    // by deleting shards through their plugins and removing chunk/shard
+    // records when fully reclaimed. Read-repair / scrub re-placement is
+    // queued but no-ops past task acknowledgement until the placement loop
+    // is wired (no parity replicas to recover from on EC(1,1) anyway).
+    {
+        let repair_w = repair.clone();
+        let store_w = store.clone();
+        let host_w = host.clone();
+        tokio::spawn(async move {
+            loop {
+                let task = match repair_w.drain_one() {
+                    Some(t) => t,
+                    None => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                tracing::info!(
+                    chunk = %hex::encode(&task.chunk_hash.as_bytes()[..8]),
+                    priority = task.priority,
+                    source = ?task.source,
+                    "repair: in-flight"
+                );
+                match task.source {
+                    os_repair::RepairSource::GcSweep => {
+                        if let Err(e) = run_gc_sweep(&store_w, &host_w, task.chunk_hash).await {
+                            tracing::warn!(error = %e, "gc-sweep failed");
+                        }
+                    }
+                    _ => {
+                        // Other sources (Scrub / ReadRepair / AntiEntropy /
+                        // Rebalance): not yet implemented. Acknowledge and
+                        // move on so the queue drains.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+                tracing::info!("repair: completed");
+            }
+        });
+    }
+
+    // Shadow sweep: periodically peek each registered shadow. If the upstream
+    // backend reports `not_found`, the shadow is Cleared (removed). If it
+    // persistently exists despite delete attempts, mark it Permanent.
+    {
+        let store_w = store.clone();
+        let host_w = host.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(2);
+            loop {
+                if let Err(e) = run_shadow_sweep(&store_w, &host_w).await {
+                    tracing::warn!(error = %e, "shadow sweep failed");
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    let fh = fault_handle.clone();
+    let fault_any = os_api::FaultHandleAny {
+        fail_puts: Arc::new({
+            let fh = fh.clone();
+            move |n| fh.fail_next_puts(n)
+        }),
+        fail_gets: Arc::new({
+            let fh = fh.clone();
+            move |n| fh.fail_next_gets(n)
+        }),
+        corrupt_gets: Arc::new({
+            let fh = fh.clone();
+            move |n| fh.corrupt_next_gets(n)
+        }),
+        pause: Arc::new({
+            let fh = fh.clone();
+            move || fh.pause()
+        }),
+        resume: Arc::new({
+            let fh = fh.clone();
+            move || fh.resume()
+        }),
+        clear: Arc::new({
+            let fh = fh.clone();
+            move || fh.clear()
+        }),
+        snapshot: Arc::new({
+            let fh = fh.clone();
+            move || {
+                let s = fh.snapshot();
+                serde_json::json!({
+                    "enabled": true,
+                    "fail_puts": s.fail_puts,
+                    "fail_gets": s.fail_gets,
+                    "corrupt_gets": s.corrupt_gets,
+                    "failed_handle_count": s.failed_handle_count,
+                    "paused": s.paused,
+                })
+            }
+        }),
+    };
 
     let app = router(AppState {
         recovery,
         vault,
         vfs,
+        identity,
+        lease,
+        repair,
+        events,
+        host,
+        device_id,
+        fault: Some(fault_any),
+        plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     tracing::info!(
         %bind,
         data_dir = %data_dir.display(),
         device_id = %device_id,
-        backend = %testbench_url,
+        backend = %backend_label,
         "openstorage starting"
     );
 
@@ -94,15 +280,113 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn persist_provider(store: &Store, provider_id: ProviderId) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_gc_sweep(
+    store: &Arc<Store>,
+    host: &Arc<Host>,
+    chunk_hash: os_types::ChunkHash,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let chunk = match store.get_chunk(chunk_hash)? {
+        Some(c) => c,
+        None => return Ok(()), // already gone
+    };
+    let mut all_done = true;
+    for shard_id in &chunk.shard_list {
+        let shard = match store.get_shard(*shard_id)? {
+            Some(s) => s,
+            None => continue,
+        };
+        let plugin = match host.get_chunk(shard.driver_id.value) {
+            Ok(p) => p,
+            Err(_) => {
+                all_done = false;
+                continue;
+            }
+        };
+        let outcome = plugin.delete(&shard.native_handle.value).await;
+        match outcome {
+            Ok(r) => match r.outcome {
+                os_types::DeleteOutcome::Removed | os_types::DeleteOutcome::NotFound => {
+                    let mut txn = os_metadata::Txn::new();
+                    txn.delete(
+                        os_metadata::ColumnFamily::Shards,
+                        shard_id.as_bytes().as_slice(),
+                    );
+                    store.commit(txn)?;
+                }
+                os_types::DeleteOutcome::Tombstoned
+                | os_types::DeleteOutcome::Abandoned
+                | os_types::DeleteOutcome::NotSupported => {
+                    // Leave Shadow Registered; shadow_sweep will eventually
+                    // peek and either Clear or mark Permanent.
+                    all_done = false;
+                }
+            },
+            Err(_) => {
+                all_done = false;
+            }
+        }
+    }
+    if all_done {
+        let mut txn = os_metadata::Txn::new();
+        txn.delete(
+            os_metadata::ColumnFamily::Chunks,
+            chunk_hash.as_bytes().as_slice(),
+        );
+        store.commit(txn)?;
+    }
+    Ok(())
+}
+
+async fn run_shadow_sweep(
+    store: &Arc<Store>,
+    host: &Arc<Host>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let backend = store.backend();
+    let mut to_clear: Vec<os_types::ShadowId> = Vec::new();
+    for kv in backend.scan_prefix(os_metadata::ColumnFamily::Shadows, b"")? {
+        let (_, v) = kv?;
+        let sh: os_entities::Shadow = ciborium::from_reader(&v[..])?;
+        let plugin = match host.get_chunk(sh.driver_id) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        match plugin.peek(&sh.native_handle).await {
+            Ok(p) => {
+                if !p.exists {
+                    to_clear.push(sh.shadow_id);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    if !to_clear.is_empty() {
+        let mut txn = os_metadata::Txn::new();
+        for id in to_clear {
+            txn.delete(
+                os_metadata::ColumnFamily::Shadows,
+                id.as_uuid().as_bytes().as_slice(),
+            );
+        }
+        store.commit(txn)?;
+    }
+    Ok(())
+}
+
+fn persist_provider(
+    store: &Store,
+    provider_id: ProviderId,
+    plugin_id: &str,
+    label: &str,
+    trust_group: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let provider = Provider {
         provider_id,
-        plugin_id: PluginId::new("org.openstorage.http_backend"),
-        instance_label: "testbench".into(),
+        plugin_id: PluginId::new(plugin_id),
+        instance_label: label.into(),
         credentials_handle: CredentialsHandle::new(vec![]).expect("empty creds fits in 64 bytes"),
         capabilities: CapabilitySet::default(),
         legal_class: LegalClass::Green,
-        trust_correlation_group: TrustCorrelationGroup::new("testbench"),
+        trust_correlation_group: TrustCorrelationGroup::new(trust_group),
         quota: QuotaState {
             total: None,
             used: None,

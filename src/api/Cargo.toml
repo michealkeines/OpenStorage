@@ -15,6 +15,10 @@ os-share = { workspace = true }
 os-recovery = { workspace = true }
 os-plugin-host = { workspace = true }
 os-events = { workspace = true }
+os-crypto = { workspace = true }
+os-lease = { workspace = true }
+os-repair = { workspace = true }
+os-metadata = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -24,13 +28,15 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }
+ciborium = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+hex = { workspace = true }
+blake3 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 os-crypto = { workspace = true }
-os-metadata = { workspace = true }
 os-sync = { workspace = true }
 os-wal = { workspace = true }
 rand = { workspace = true }

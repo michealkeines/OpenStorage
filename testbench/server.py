@@ -46,10 +46,12 @@ import uvicorn
 LOG = logging.getLogger("openstorage-testbench")
 DATA_DIR = Path(os.environ.get("TESTBENCH_DATA_DIR", "./testbench-data")).resolve()
 OBJECTS_DIR = DATA_DIR / "objects"
+NAMED_DIR = DATA_DIR / "named"
 COMMENTS_FILE = DATA_DIR / "comments.json"
 INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 
 OBJECTS_DIR.mkdir(parents=True, exist_ok=True)
+NAMED_DIR.mkdir(parents=True, exist_ok=True)
 if not COMMENTS_FILE.exists():
     COMMENTS_FILE.write_text("[]")
 
@@ -213,6 +215,91 @@ def list_objects(prefix: str = "", limit: int = 1000):
         if len(items) >= limit:
             break
     return {"objects": items}
+
+
+# ─── named (vault-role) endpoints ──────────────────────────────────────────
+def _named_path(name: str) -> Path:
+    if not name or ".." in name or name.startswith("/"):
+        raise HTTPException(400, f"invalid name: {name!r}")
+    p = NAMED_DIR / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+@app.put("/v1/named/{name:path}")
+async def put_named(name: str, request: Request) -> JSONResponse:
+    """CAS write under a logical name. Optional `If-Match` header carries the
+    expected etag (BLAKE2b-256 hex) the caller saw."""
+    path = _named_path(name)
+    expected_etag = request.headers.get("if-match")
+    current = _compute_etag(path) if path.exists() else None
+    if expected_etag and expected_etag != current:
+        return JSONResponse(
+            {"outcome": "etag_mismatch", "current_etag": current},
+            status_code=412,
+        )
+    if expected_etag is None and current is not None:
+        return JSONResponse(
+            {"outcome": "etag_mismatch", "current_etag": current, "note": "no If-Match given but resource exists"},
+            status_code=412,
+        )
+    body = await request.body()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_bytes(body)
+    tmp.replace(path)
+    new_etag = _compute_etag(path)
+    return JSONResponse({"outcome": "written", "new_etag": new_etag, "size": len(body)})
+
+
+@app.get("/v1/named/{name:path}")
+def get_named(name: str):
+    path = _named_path(name)
+    if not path.exists():
+        raise HTTPException(404, "not found")
+    return StreamingResponse(_stream_iter(path), media_type="application/octet-stream",
+                             headers={"Content-Length": str(path.stat().st_size),
+                                      "ETag": _compute_etag(path)})
+
+
+@app.head("/v1/named/{name:path}")
+def head_named(name: str):
+    path = _named_path(name)
+    if not path.exists():
+        raise HTTPException(404, "not found")
+    st = path.stat()
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Length": str(st.st_size),
+            "ETag": _compute_etag(path),
+            "X-Stored-At": str(int(st.st_mtime)),
+        },
+    )
+
+
+@app.get("/v1/named")
+def list_named(prefix: str = "", limit: int = 100, cursor: Optional[str] = None):
+    items = []
+    for p in sorted(NAMED_DIR.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(NAMED_DIR))
+        if not rel.startswith(prefix):
+            continue
+        if cursor and rel <= cursor:
+            continue
+        st = p.stat()
+        items.append({
+            "name": rel,
+            "size": st.st_size,
+            "etag": _compute_etag(p),
+            "mtime": int(st.st_mtime),
+        })
+        if len(items) >= limit:
+            break
+    next_cursor = items[-1]["name"] if len(items) >= limit else None
+    return {"entries": items, "next_cursor": next_cursor}
 
 
 @app.get("/v1/health")

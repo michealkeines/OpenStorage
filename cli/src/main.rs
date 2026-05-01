@@ -78,6 +78,201 @@ enum Cmd {
         #[arg(long, default_value = "/")]
         prefix: String,
     },
+    /// Show metadata for a single file (HEAD).
+    Stat {
+        /// Remote name.
+        name: String,
+    },
+    /// Delete a file from the active vault.
+    Rm {
+        /// Remote name.
+        name: String,
+    },
+    /// Destroy the active vault (requires --confirm).
+    Destroy {
+        /// Type the vault id to confirm.
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Rotate the master key with a new passphrase.
+    RotateMk {
+        /// New passphrase. Auto-saved to state.json.
+        #[arg(long)]
+        new_passphrase: String,
+    },
+    /// Show identity chain on the active vault.
+    Identity {
+        #[command(subcommand)]
+        cmd: IdentityCmd,
+    },
+    /// Recovery configuration ops.
+    Recovery {
+        #[command(subcommand)]
+        cmd: RecoveryCmd,
+    },
+    /// Advisory lease ops.
+    Lease {
+        #[command(subcommand)]
+        cmd: LeaseCmd,
+    },
+    /// WAL inspection.
+    Wal {
+        #[command(subcommand)]
+        cmd: WalCmd,
+    },
+    /// Snapshot inspection.
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCmd,
+    },
+    /// Provider inventory.
+    Providers {
+        #[command(subcommand)]
+        cmd: ProvidersCmd,
+    },
+    /// Peer inventory.
+    Peers {
+        #[command(subcommand)]
+        cmd: PeersCmd,
+    },
+    /// Shadow registry inspection.
+    Shadows {
+        #[command(subcommand)]
+        cmd: ShadowsCmd,
+    },
+    /// Repair queue operations.
+    Repair {
+        #[command(subcommand)]
+        cmd: RepairCmd,
+    },
+    /// Share inventory.
+    Shares {
+        #[command(subcommand)]
+        cmd: SharesCmd,
+    },
+    /// Tail recent events.
+    Events {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Fault-injection control (test-only).
+    Fault {
+        #[command(subcommand)]
+        cmd: FaultCmd,
+    },
+    /// Plugin-state machine transitions.
+    PluginState {
+        #[command(subcommand)]
+        cmd: PluginStateCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FaultCmd {
+    Show,
+    /// Set or clear fault counters in one shot.
+    Set {
+        #[arg(long)]
+        fail_puts: Option<u32>,
+        #[arg(long)]
+        fail_gets: Option<u32>,
+        #[arg(long)]
+        corrupt_gets: Option<u32>,
+        #[arg(long)]
+        pause: Option<bool>,
+    },
+    /// Clear all fault counters and unpause.
+    Clear,
+}
+
+#[derive(Subcommand, Debug)]
+enum PluginStateCmd {
+    Show {
+        provider_id: String,
+    },
+    /// Drive a state transition. transition ∈ init|ready|activate|pause|resume|disable|close.
+    Set {
+        provider_id: String,
+        transition: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IdentityCmd {
+    Show,
+    Rotate,
+}
+
+#[derive(Subcommand, Debug)]
+enum RecoveryCmd {
+    Show,
+    RotateToken,
+}
+
+#[derive(Subcommand, Debug)]
+enum LeaseCmd {
+    Show,
+    Acquire,
+    Renew,
+    Release,
+}
+
+#[derive(Subcommand, Debug)]
+enum WalCmd {
+    Show,
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotCmd {
+    Show,
+    Push,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProvidersCmd {
+    Ls,
+}
+
+#[derive(Subcommand, Debug)]
+enum PeersCmd {
+    Ls,
+}
+
+#[derive(Subcommand, Debug)]
+enum ShadowsCmd {
+    Ls,
+}
+
+#[derive(Subcommand, Debug)]
+enum RepairCmd {
+    Show,
+    /// Manually enqueue a repair task (test-only).
+    Enqueue {
+        /// 32-byte chunk hash, hex-encoded.
+        #[arg(long)]
+        chunk_hash: String,
+        #[arg(long, default_value_t = 1)]
+        priority: u32,
+        #[arg(long, default_value = "scrub")]
+        source: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SharesCmd {
+    Ls,
+    /// Create a share (test mode — KEM is a placeholder).
+    Create {
+        /// PeerId. Use `peer:test-recipient` for the harness.
+        #[arg(long)]
+        recipient: String,
+        /// Path scope (`*` for whole vault).
+        #[arg(long)]
+        scope: String,
+    },
+    Revoke {
+        share_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +333,23 @@ async fn main() -> Result<()> {
             download(&client, &cli.base, &name, out, verify).await
         }
         Cmd::Ls { prefix } => ls(&client, &cli.base, &prefix).await,
+        Cmd::Stat { name } => stat(&client, &cli.base, &name).await,
+        Cmd::Rm { name } => rm(&client, &cli.base, &name).await,
+        Cmd::Destroy { confirm } => destroy(&client, &cli.base, &confirm).await,
+        Cmd::RotateMk { new_passphrase } => rotate_mk(&client, &cli.base, &new_passphrase).await,
+        Cmd::Identity { cmd } => identity_cmd(&client, &cli.base, cmd).await,
+        Cmd::Recovery { cmd } => recovery_cmd(&client, &cli.base, cmd).await,
+        Cmd::Lease { cmd } => lease_cmd(&client, &cli.base, cmd).await,
+        Cmd::Wal { cmd } => wal_cmd(&client, &cli.base, cmd).await,
+        Cmd::Snapshot { cmd } => snapshot_cmd(&client, &cli.base, cmd).await,
+        Cmd::Providers { cmd } => providers_cmd(&client, &cli.base, cmd).await,
+        Cmd::Peers { cmd } => peers_cmd(&client, &cli.base, cmd).await,
+        Cmd::Shadows { cmd } => shadows_cmd(&client, &cli.base, cmd).await,
+        Cmd::Repair { cmd } => repair_cmd(&client, &cli.base, cmd).await,
+        Cmd::Shares { cmd } => shares_cmd(&client, &cli.base, cmd).await,
+        Cmd::Events { limit } => events_tail(&client, &cli.base, limit).await,
+        Cmd::Fault { cmd } => fault_cmd(&client, &cli.base, cmd).await,
+        Cmd::PluginState { cmd } => plugin_state_cmd(&client, &cli.base, cmd).await,
     }
 }
 
@@ -396,6 +608,59 @@ async fn download(
     Ok(())
 }
 
+async fn stat(client: &reqwest::Client, base: &str, name: &str) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault — run `os init` first"))?;
+    ensure_unlocked(client, base, &st).await?;
+    let remote = if name.starts_with('/') {
+        name.to_string()
+    } else {
+        format!("/{name}")
+    };
+    let url = format!("{base}/v1/vaults/{}/files{remote}", st.vault_id);
+    let resp = client.head(&url).send().await?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        bail!("not found: {name}");
+    }
+    if !status.is_success() {
+        bail!("stat failed: {status}");
+    }
+    let size = resp
+        .headers()
+        .get("x-size-bytes")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("?");
+    let file_id = resp
+        .headers()
+        .get("x-file-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("?");
+    println!("path:    {name}");
+    println!("size:    {size} bytes");
+    println!("file_id: {file_id}");
+    Ok(())
+}
+
+async fn rm(client: &reqwest::Client, base: &str, name: &str) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault — run `os init` first"))?;
+    ensure_unlocked(client, base, &st).await?;
+    let remote = if name.starts_with('/') {
+        name.to_string()
+    } else {
+        format!("/{name}")
+    };
+    let url = format!("{base}/v1/vaults/{}/files{remote}", st.vault_id);
+    let resp = client.delete(&url).send().await?;
+    if resp.status().as_u16() == 404 {
+        bail!("not found: {name}");
+    }
+    if !resp.status().is_success() {
+        bail!("delete failed: {}", resp.status());
+    }
+    println!("✓ deleted {name}");
+    Ok(())
+}
+
 async fn ls(client: &reqwest::Client, base: &str, prefix: &str) -> Result<()> {
     let st = State::load()?.ok_or_else(|| anyhow!("no saved vault — run `os init` first"))?;
     ensure_unlocked(client, base, &st).await?;
@@ -484,4 +749,430 @@ impl futures::Stream for ProgressStream {
             other => other,
         }
     }
+}
+
+// ─── new subcommand handlers ───────────────────────────────────────────────
+
+async fn destroy(client: &reqwest::Client, base: &str, confirm: &str) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault — run `os init` first"))?;
+    if confirm != st.vault_id {
+        bail!("--confirm must equal the active vault id ({})", st.vault_id);
+    }
+    let resp = client
+        .delete(format!("{base}/v1/vaults/{}", st.vault_id))
+        .header("x-confirm-destroy", "yes")
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        bail!("destroy failed: {status} {body}");
+    }
+    println!("✓ destroyed vault {}", st.vault_id);
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    // Remove the saved state file.
+    let p = State::path()?;
+    let _ = std::fs::remove_file(&p);
+    Ok(())
+}
+
+async fn rotate_mk(client: &reqwest::Client, base: &str, new_pass: &str) -> Result<()> {
+    let mut st = State::load()?.ok_or_else(|| anyhow!("no saved vault — run `os init` first"))?;
+    ensure_unlocked(client, base, &st).await?;
+    let resp = client
+        .post(format!("{base}/v1/vaults/{}/rotate-mk", st.vault_id))
+        .json(&serde_json::json!({ "new_passphrase": new_pass }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("rotate-mk failed: {s} {body}");
+    }
+    st.passphrase = new_pass.to_string();
+    st.save()?;
+    println!("✓ master key rotated; saved new passphrase to {}", State::path()?.display());
+    Ok(())
+}
+
+async fn identity_cmd(client: &reqwest::Client, base: &str, cmd: IdentityCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        IdentityCmd::Show => {
+            let resp = client
+                .get(format!("{base}/v1/vaults/{}/identity", st.vault_id))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        IdentityCmd::Rotate => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/identity/rotate", st.vault_id))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("identity rotate failed: {s} {body}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ rotated identity to epoch {}", body["new_epoch"]);
+            println!("  fingerprint: {}", body["fingerprint"].as_str().unwrap_or("?"));
+        }
+    }
+    Ok(())
+}
+
+async fn recovery_cmd(client: &reqwest::Client, base: &str, cmd: RecoveryCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        RecoveryCmd::Show => {
+            let resp = client
+                .get(format!("{base}/v1/vaults/{}/recovery", st.vault_id))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        RecoveryCmd::RotateToken => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/recovery/rotate-token", st.vault_id))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("rotate-token failed: {s} {body}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ rotated recovery token: {}", body["new_token_id"].as_str().unwrap_or("?"));
+        }
+    }
+    Ok(())
+}
+
+async fn lease_cmd(client: &reqwest::Client, base: &str, cmd: LeaseCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    let url_base = format!("{base}/v1/vaults/{}/lease", st.vault_id);
+    match cmd {
+        LeaseCmd::Show => {
+            let resp = client.get(&url_base).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        LeaseCmd::Acquire => {
+            let resp = client.post(&url_base).send().await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("acquire failed: {s} {body}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ lease acquired: {}", serde_json::to_string_pretty(&body)?);
+        }
+        LeaseCmd::Renew => {
+            let resp = client.post(format!("{url_base}/renew")).send().await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("renew failed: {s} {body}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ lease renewed: {}", serde_json::to_string_pretty(&body)?);
+        }
+        LeaseCmd::Release => {
+            let resp = client.delete(&url_base).send().await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("release failed: {s} {body}");
+            }
+            println!("✓ lease released");
+        }
+    }
+    Ok(())
+}
+
+async fn wal_cmd(client: &reqwest::Client, base: &str, cmd: WalCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        WalCmd::Show => {
+            let resp = client.get(format!("{base}/v1/vaults/{}/wal", st.vault_id)).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+    }
+    Ok(())
+}
+
+async fn snapshot_cmd(client: &reqwest::Client, base: &str, cmd: SnapshotCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        SnapshotCmd::Show => {
+            let resp = client
+                .get(format!("{base}/v1/vaults/{}/snapshot", st.vault_id))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        SnapshotCmd::Push => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/snapshot/push", st.vault_id))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("push failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ snapshot pushed: {}", serde_json::to_string_pretty(&body)?);
+        }
+    }
+    Ok(())
+}
+
+async fn providers_cmd(client: &reqwest::Client, base: &str, cmd: ProvidersCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        ProvidersCmd::Ls => {
+            let resp = client
+                .get(format!("{base}/v1/vaults/{}/providers", st.vault_id))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            if let Some(arr) = body["providers"].as_array() {
+                println!("{:<40}  {:<28}  {:<14}  health", "provider_id", "plugin_id", "trust_group");
+                for p in arr {
+                    println!(
+                        "{:<40}  {:<28}  {:<14}  {:.2}",
+                        p["provider_id"].as_str().unwrap_or("?"),
+                        p["plugin_id"].as_str().unwrap_or("?"),
+                        p["trust_correlation_group"].as_str().unwrap_or("?"),
+                        p["health"].as_f64().unwrap_or(0.0),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn peers_cmd(client: &reqwest::Client, base: &str, cmd: PeersCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        PeersCmd::Ls => {
+            let resp = client
+                .get(format!("{base}/v1/vaults/{}/peers", st.vault_id))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            if let Some(arr) = body["peers"].as_array() {
+                if arr.is_empty() {
+                    println!("(no peers)");
+                } else {
+                    for p in arr {
+                        println!("- {} (label={}, verified={}, epochs={})",
+                            p["peer_id"].as_str().unwrap_or("?"),
+                            p["label"].as_str().unwrap_or("?"),
+                            p["verified"].as_bool().unwrap_or(false),
+                            p["epoch_count"].as_u64().unwrap_or(0),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn shadows_cmd(client: &reqwest::Client, base: &str, cmd: ShadowsCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        ShadowsCmd::Ls => {
+            let resp = client
+                .get(format!("{base}/v1/vaults/{}/shadows", st.vault_id))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            if let Some(arr) = body["shadows"].as_array() {
+                if arr.is_empty() {
+                    println!("(no shadows)");
+                } else {
+                    for sh in arr {
+                        println!("- {}  size={} reason={} chunk={}",
+                            sh["shadow_id"].as_str().unwrap_or("?"),
+                            sh["ciphertext_length"].as_u64().unwrap_or(0),
+                            sh["reason"].as_str().unwrap_or("?"),
+                            &sh["original_chunk_hash"].as_str().unwrap_or("?")[..16],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn repair_cmd(client: &reqwest::Client, base: &str, cmd: RepairCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        RepairCmd::Show => {
+            let resp = client
+                .get(format!("{base}/v1/vaults/{}/repair", st.vault_id))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        RepairCmd::Enqueue { chunk_hash, priority, source } => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/repair", st.vault_id))
+                .json(&serde_json::json!({
+                    "chunk_hash_hex": chunk_hash,
+                    "priority": priority,
+                    "source": source,
+                }))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("enqueue failed: {s} {body}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ enqueued; queue depth = {}", body["queue_depth"]);
+        }
+    }
+    Ok(())
+}
+
+async fn shares_cmd(client: &reqwest::Client, base: &str, cmd: SharesCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    let url = format!("{base}/v1/vaults/{}/shares", st.vault_id);
+    match cmd {
+        SharesCmd::Ls => {
+            let resp = client.get(&url).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if let Some(arr) = body["shares"].as_array() {
+                if arr.is_empty() {
+                    println!("(no shares)");
+                } else {
+                    for sh in arr {
+                        println!("- {} → {}  scope={}  revoked={}",
+                            sh["share_id"].as_str().unwrap_or("?"),
+                            sh["recipient"].as_str().unwrap_or("?"),
+                            sh["scope"].as_str().unwrap_or("?"),
+                            sh["revoked"].as_bool().unwrap_or(false),
+                        );
+                    }
+                }
+            }
+        }
+        SharesCmd::Create { recipient, scope } => {
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({"recipient": recipient, "scope": scope}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("create share failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ share created: {}", serde_json::to_string_pretty(&body)?);
+        }
+        SharesCmd::Revoke { share_id } => {
+            let resp = client.delete(format!("{url}/{share_id}")).send().await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("revoke failed: {s} {b}");
+            }
+            println!("✓ share revoked");
+        }
+    }
+    Ok(())
+}
+
+async fn events_tail(client: &reqwest::Client, base: &str, limit: usize) -> Result<()> {
+    let resp = client.get(format!("{base}/v1/system/events?limit={limit}")).send().await?;
+    let body: serde_json::Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
+}
+
+async fn fault_cmd(client: &reqwest::Client, base: &str, cmd: FaultCmd) -> Result<()> {
+    let url = format!("{base}/v1/system/fault");
+    match cmd {
+        FaultCmd::Show => {
+            let resp = client.get(&url).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        FaultCmd::Set { fail_puts, fail_gets, corrupt_gets, pause } => {
+            let mut req = serde_json::Map::new();
+            if let Some(n) = fail_puts { req.insert("fail_puts".into(), serde_json::json!(n)); }
+            if let Some(n) = fail_gets { req.insert("fail_gets".into(), serde_json::json!(n)); }
+            if let Some(n) = corrupt_gets { req.insert("corrupt_gets".into(), serde_json::json!(n)); }
+            if let Some(p) = pause { req.insert("pause".into(), serde_json::json!(p)); }
+            let resp = client.post(&url).json(&serde_json::Value::Object(req)).send().await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("fault set failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ fault state: {}", serde_json::to_string_pretty(&body)?);
+        }
+        FaultCmd::Clear => {
+            let resp = client.delete(&url).send().await?;
+            if !resp.status().is_success() {
+                bail!("clear failed: {}", resp.status());
+            }
+            println!("✓ fault cleared");
+        }
+    }
+    Ok(())
+}
+
+async fn plugin_state_cmd(client: &reqwest::Client, base: &str, cmd: PluginStateCmd) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault"))?;
+    ensure_unlocked(client, base, &st).await?;
+    match cmd {
+        PluginStateCmd::Show { provider_id } => {
+            let url = format!("{base}/v1/vaults/{}/providers/{}/state", st.vault_id, provider_id);
+            let resp = client.get(&url).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        PluginStateCmd::Set { provider_id, transition } => {
+            let url = format!("{base}/v1/vaults/{}/providers/{}/state", st.vault_id, provider_id);
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({"transition": transition}))
+                .send().await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("set state failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ {}", serde_json::to_string_pretty(&body)?);
+        }
+    }
+    Ok(())
 }

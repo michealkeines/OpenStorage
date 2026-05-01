@@ -419,13 +419,49 @@ impl VfsService {
             )));
         }
 
-        // Put each shard via its provider.
+        // For every placement-picked primary, build a fallback list of
+        // providers in the *same* trust group (preserves diversity since the
+        // shard still ends up in that group). The dispatcher picks the most-
+        // ready candidate at call time, so a rate-limited primary doesn't
+        // block the chunk — the bytes flow to a sibling and the resulting
+        // Shard.driver_id reflects who actually accepted them.
+        let primary_groups = group_lookup(&pool, &picks);
+        let mut already_used: std::collections::BTreeSet<os_types::TrustCorrelationGroup> =
+            std::collections::BTreeSet::new();
         let mut shard_records: Vec<(Shard, ProviderId)> = Vec::with_capacity(picks.len());
-        for (es, (shard_index, provider_id)) in enc.shards.iter().zip(picks.iter()) {
-            let plugin = self.plugin_host.get_chunk(*provider_id)?;
-            let put = plugin
-                .put(&es.ciphertext, &PutHint::default())
-                .await?;
+        for (es, (shard_index, primary_id)) in enc.shards.iter().zip(picks.iter()) {
+            let group = primary_groups
+                .get(primary_id)
+                .cloned()
+                .unwrap_or_else(|| os_types::TrustCorrelationGroup::new("unknown"));
+            // Candidates: primary first, then siblings in the same group.
+            // Skip groups already used by other shards if diversity is on
+            // (defensive — placement should already have ensured distinct
+            // groups across shards, but if it can't pick this one again we
+            // keep the invariant locally).
+            let mut candidates: Vec<ProviderId> = vec![*primary_id];
+            for entry in &pool.providers {
+                if entry.provider_id == *primary_id {
+                    continue;
+                }
+                if entry.trust_group == group
+                    && (!policy.require_distinct_trust_groups
+                        || !already_used.contains(&entry.trust_group))
+                {
+                    candidates.push(entry.provider_id);
+                }
+            }
+
+            let dispatched = os_plugin_host::PoolDispatcher::put_with_fallback(
+                &self.plugin_host,
+                &candidates,
+                &es.ciphertext,
+                &PutHint::default(),
+                os_plugin_host::DispatcherConfig::default(),
+            )
+            .await?;
+            already_used.insert(group);
+
             shard_records.push((
                 Shard {
                     shard_id: es.shard_id,
@@ -435,23 +471,23 @@ impl VfsService {
                     encryption_tag: enc.tag,
                     ciphertext_length: es.ciphertext.len() as u64,
                     driver_id: os_entities::LwwSet::new(
-                        *provider_id,
+                        dispatched.provider_id,
                         None,
                         next_hlc(&self.sync),
                         self.sync.wal().device_id(),
                     ),
                     native_handle: os_entities::LwwSet::new(
-                        put.handle,
+                        dispatched.handle,
                         None,
                         next_hlc(&self.sync),
                         self.sync.wal().device_id(),
                     ),
-                    stored_at: put.stored_at,
+                    stored_at: Timestamp::from_string(now_iso()),
                     last_verified_at: Timestamp::from_string(now_iso()),
                     health_score: HealthScore::new(1.0),
                     ack_state: AckState::Acked,
                 },
-                *provider_id,
+                dispatched.provider_id,
             ));
         }
 
@@ -560,7 +596,34 @@ impl VfsService {
         let device = self.sync.wal().device_id();
         let hlc = next_hlc(&self.sync);
         file.exists = LwwRegister::new(false, hlc, device);
+
+        // Register shadows for each shard of each chunk (for chunked files).
+        // Shadow records persist regardless of plugin reachability — that's
+        // the "no silent leaks" invariant.
         let mut txn = Txn::new();
+        if let Some(chunk_list) = file.chunk_list.clone() {
+            for ch in &chunk_list {
+                if let Some(chunk) = self.store.get_chunk(*ch)? {
+                    for shard_id in &chunk.shard_list {
+                        if let Some(shard) = self.store.get_shard(*shard_id)? {
+                            let shadow = os_entities::Shadow {
+                                shadow_id: os_types::ShadowId::new_v7(),
+                                original_chunk_hash: *ch,
+                                driver_id: shard.driver_id.value,
+                                native_handle: shard.native_handle.value.clone(),
+                                ciphertext_length: shard.ciphertext_length,
+                                abandoned_at: Timestamp::from_string(now_iso()),
+                                reason: os_entities::ShadowReason::DeletionOrphaned,
+                                cached_elsewhere_risk: os_types::CachedElsewhereRisk::Low,
+                                counts_against_quota: true,
+                                tombstone_clears_at: None,
+                            };
+                            self.store.put_shadow(&mut txn, &shadow)?;
+                        }
+                    }
+                }
+            }
+        }
         self.store.put_file(&mut txn, &file)?;
         self.store.commit(txn)?;
         Ok(())
@@ -605,6 +668,19 @@ impl VfsService {
         }
         Ok(None)
     }
+}
+
+fn group_lookup(
+    pool: &os_placement::PoolSnapshot,
+    picks: &[(u8, ProviderId)],
+) -> std::collections::BTreeMap<ProviderId, os_types::TrustCorrelationGroup> {
+    let mut out = std::collections::BTreeMap::new();
+    for (_, id) in picks {
+        if let Some(entry) = pool.providers.iter().find(|p| p.provider_id == *id) {
+            out.insert(*id, entry.trust_group.clone());
+        }
+    }
+    out
 }
 
 fn inline_aad(file_id: FileId, path: &str) -> Vec<u8> {

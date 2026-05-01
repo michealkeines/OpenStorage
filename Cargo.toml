@@ -27,6 +27,10 @@ members = [
     "app",
     "cli",
     "plugins/http_backend",
+    "plugins/fault_inject",
+    "plugins/zerox_st",
+    "plugins/telegram",
+    "plugins/discord",
 ]
 
 [workspace.package]
@@ -91,6 +95,10 @@ os-plugin-host = { path = "src/plugin_host" }
 os-vfs = { path = "src/vfs" }
 os-api = { path = "src/api" }
 os-plugin-http-backend = { path = "plugins/http_backend" }
+os-plugin-fault-inject = { path = "plugins/fault_inject" }
+os-plugin-zeroxst = { path = "plugins/zerox_st" }
+os-plugin-telegram = { path = "plugins/telegram" }
+os-plugin-discord = { path = "plugins/discord" }
 
 [profile.dev]
 opt-level = 0
