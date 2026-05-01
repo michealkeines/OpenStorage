@@ -165,6 +165,60 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PluginStateCmd,
     },
+    /// Manage credentials in the user's providers file.
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthCmd {
+    /// List configured providers (secrets redacted).
+    Ls,
+    /// Print the path of the providers file.
+    Path,
+    /// Remove a provider entry by label.
+    Rm { label: String },
+    /// Add a credential entry. Each subcommand walks an interactive flow:
+    /// opens a browser when relevant, prompts for paste, validates against
+    /// the live API, then writes to the providers file (mode 0600).
+    Add {
+        #[command(subcommand)]
+        kind: AuthKind,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthKind {
+    /// GitHub repo (Personal Access Token). Opens browser to GitHub's
+    /// new-token page; user pastes the token; CLI validates by hitting
+    /// /user, then prompts for owner/repo/branch.
+    Github {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Telegram bot. Prompts for bot_token + chat_id, validates via /getMe.
+    Telegram {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Discord webhook. Prompts for webhook URL, validates via HEAD.
+    Discord {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Mint a fresh anonymous Telegraph account and save its access_token.
+    Telegraph {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// uguu.se — anonymous, no credential. Adds an entry so the engine
+    /// registers it as a provider on startup.
+    Uguu {
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -350,6 +404,7 @@ async fn main() -> Result<()> {
         Cmd::Events { limit } => events_tail(&client, &cli.base, limit).await,
         Cmd::Fault { cmd } => fault_cmd(&client, &cli.base, cmd).await,
         Cmd::PluginState { cmd } => plugin_state_cmd(&client, &cli.base, cmd).await,
+        Cmd::Auth { cmd } => auth_cmd(&client, cmd).await,
     }
 }
 
@@ -1175,4 +1230,323 @@ async fn plugin_state_cmd(client: &reqwest::Client, base: &str, cmd: PluginState
         }
     }
     Ok(())
+}
+
+// ─── auth: providers-file management + interactive flows ──────────────────
+
+/// Canonical path of the providers/secrets file. Engine and CLI must agree.
+fn providers_path() -> Result<PathBuf> {
+    let dir = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| {
+            let mut p = PathBuf::from(h);
+            p.push("Library/Application Support/openstorage");
+            p
+        })
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(|a| {
+            let mut p = PathBuf::from(a);
+            p.push("openstorage");
+            p
+        })
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| {
+                    let mut p = PathBuf::from(h);
+                    p.push(".config");
+                    p
+                })
+            })
+            .map(|mut p| {
+                p.push("openstorage");
+                p
+            })
+    };
+    let dir = dir.ok_or_else(|| anyhow!("could not resolve config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("providers.json"))
+}
+
+fn load_providers() -> Result<Vec<serde_json::Value>> {
+    let p = providers_path()?;
+    if !p.exists() {
+        return Ok(Vec::new());
+    }
+    let s = std::fs::read_to_string(&p)?;
+    let v: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap_or_default();
+    Ok(v)
+}
+
+fn save_providers(entries: &[serde_json::Value]) -> Result<()> {
+    let p = providers_path()?;
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(entries)?)?;
+    std::fs::rename(&tmp, &p)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn redact(s: &str) -> String {
+    if s.len() <= 8 {
+        "****".into()
+    } else {
+        format!("{}…{}", &s[..4], "*".repeat(8))
+    }
+}
+
+fn read_secret_line(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    stdin.lock().read_line(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
+fn open_browser(url: &str) -> bool {
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "start"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(cmd)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+async fn auth_cmd(client: &reqwest::Client, cmd: AuthCmd) -> Result<()> {
+    match cmd {
+        AuthCmd::Path => {
+            println!("{}", providers_path()?.display());
+        }
+        AuthCmd::Ls => {
+            let entries = load_providers()?;
+            if entries.is_empty() {
+                println!("(no providers yet — run `os auth add <kind>` to add one)");
+                return Ok(());
+            }
+            println!("{:<20}  {:<14}  {}", "label", "kind", "secret/url (redacted)");
+            for e in &entries {
+                let label = e["label"].as_str().unwrap_or("?");
+                let kind = e["kind"].as_str().unwrap_or("?");
+                let secret = e["access_token"]
+                    .as_str()
+                    .or_else(|| e["bot_token"].as_str())
+                    .or_else(|| e["webhook_url"].as_str())
+                    .unwrap_or("(no secret)");
+                println!("{label:<20}  {kind:<14}  {}", redact(secret));
+            }
+        }
+        AuthCmd::Rm { label } => {
+            let mut entries = load_providers()?;
+            let before = entries.len();
+            entries.retain(|e| e["label"].as_str() != Some(&label));
+            if entries.len() == before {
+                bail!("no entry with label '{}'", label);
+            }
+            save_providers(&entries)?;
+            println!("✓ removed {label}");
+        }
+        AuthCmd::Add { kind } => match kind {
+            AuthKind::Github { label } => add_github(client, label).await?,
+            AuthKind::Telegram { label } => add_telegram(client, label).await?,
+            AuthKind::Discord { label } => add_discord(client, label).await?,
+            AuthKind::Telegraph { label } => add_telegraph(client, label).await?,
+            AuthKind::Uguu { label } => add_uguu(label)?,
+        },
+    }
+    Ok(())
+}
+
+async fn add_github(client: &reqwest::Client, label: Option<String>) -> Result<()> {
+    let label = label.unwrap_or_else(|| {
+        format!("github-{}", chrono_like_label())
+    });
+    let url = "https://github.com/settings/tokens/new?scopes=repo&description=openstorage";
+    println!("Opening browser to GitHub's new-token page (scope: repo).");
+    println!("  {url}");
+    if !open_browser(url) {
+        println!("(could not open a browser; copy the URL manually)");
+    }
+    let token = read_secret_line("Paste the new Personal Access Token: ")?;
+    if token.is_empty() {
+        bail!("empty token");
+    }
+    // Validate against /user.
+    let resp = client
+        .get("https://api.github.com/user")
+        .header("authorization", format!("token {token}"))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "openstorage-cli")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("token validation failed: {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let login = v["login"].as_str().unwrap_or("?").to_string();
+    println!("✓ token valid (login = {login})");
+
+    let owner = read_line(&format!("owner [default {login}]: "))?;
+    let owner = if owner.is_empty() { login.clone() } else { owner };
+    let repo = read_line("repo (must already exist): ")?;
+    if repo.is_empty() {
+        bail!("repo required");
+    }
+    let branch = read_line("branch [default main]: ")?;
+    let branch = if branch.is_empty() { "main".into() } else { branch };
+
+    let mut entries = load_providers()?;
+    entries.retain(|e| e["label"].as_str() != Some(&label));
+    entries.push(serde_json::json!({
+        "kind": "github",
+        "label": label,
+        "owner": owner,
+        "repo": repo,
+        "branch": branch,
+        "access_token": token,
+    }));
+    save_providers(&entries)?;
+    println!("✓ saved {label} → {}", providers_path()?.display());
+    Ok(())
+}
+
+async fn add_telegram(client: &reqwest::Client, label: Option<String>) -> Result<()> {
+    let label = label.unwrap_or_else(|| format!("telegram-{}", chrono_like_label()));
+    println!("Open https://t.me/BotFather → /newbot to create a bot, then come back.");
+    let token = read_secret_line("Bot token: ")?;
+    if token.is_empty() {
+        bail!("token required");
+    }
+    let resp = client
+        .get(format!("https://api.telegram.org/bot{token}/getMe"))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("getMe failed: {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    if v["ok"].as_bool() != Some(true) {
+        bail!("getMe returned ok=false: {v}");
+    }
+    let username = v["result"]["username"].as_str().unwrap_or("?");
+    println!("✓ bot @{username}");
+    println!("Send any message to your bot now, then return to this prompt.");
+    let chat = read_line("chat_id (or press enter to read /getUpdates): ")?;
+    let chat = if !chat.is_empty() {
+        chat
+    } else {
+        let resp = client
+            .get(format!("https://api.telegram.org/bot{token}/getUpdates"))
+            .send()
+            .await?;
+        let v: serde_json::Value = resp.json().await?;
+        let updates = v["result"].as_array().cloned().unwrap_or_default();
+        let chat_id = updates
+            .iter()
+            .filter_map(|u| u["message"]["chat"]["id"].as_i64())
+            .next()
+            .ok_or_else(|| anyhow!("no chat in /getUpdates; send a message to the bot first"))?;
+        chat_id.to_string()
+    };
+    let mut entries = load_providers()?;
+    entries.retain(|e| e["label"].as_str() != Some(&label));
+    entries.push(serde_json::json!({
+        "kind": "telegram",
+        "label": label,
+        "bot_token": token,
+        "chat_id": chat,
+    }));
+    save_providers(&entries)?;
+    println!("✓ saved {label}");
+    Ok(())
+}
+
+async fn add_discord(client: &reqwest::Client, label: Option<String>) -> Result<()> {
+    let label = label.unwrap_or_else(|| format!("discord-{}", chrono_like_label()));
+    println!("In Discord: server → channel → Integrations → Webhooks → New Webhook → Copy URL");
+    let url = read_secret_line("Webhook URL: ")?;
+    if !url.starts_with("https://discord.com/api/webhooks/")
+        && !url.starts_with("https://discordapp.com/api/webhooks/")
+    {
+        bail!("not a Discord webhook URL");
+    }
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        bail!("webhook validation failed: {}", resp.status());
+    }
+    let mut entries = load_providers()?;
+    entries.retain(|e| e["label"].as_str() != Some(&label));
+    entries.push(serde_json::json!({
+        "kind": "discord",
+        "label": label,
+        "webhook_url": url,
+    }));
+    save_providers(&entries)?;
+    println!("✓ saved {label}");
+    Ok(())
+}
+
+async fn add_telegraph(client: &reqwest::Client, label: Option<String>) -> Result<()> {
+    let label = label.unwrap_or_else(|| format!("telegraph-{}", chrono_like_label()));
+    let resp = client
+        .post("https://api.telegra.ph/createAccount")
+        .form(&[("short_name", "openstorage"), ("author_name", "anon")])
+        .send()
+        .await?;
+    let v: serde_json::Value = resp.json().await?;
+    if v["ok"].as_bool() != Some(true) {
+        bail!("createAccount failed: {v}");
+    }
+    let token = v["result"]["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no access_token in response"))?;
+    let mut entries = load_providers()?;
+    entries.retain(|e| e["label"].as_str() != Some(&label));
+    entries.push(serde_json::json!({
+        "kind": "telegraph",
+        "label": label,
+        "access_token": token,
+    }));
+    save_providers(&entries)?;
+    println!("✓ minted anonymous Telegraph account; saved as {label}");
+    Ok(())
+}
+
+fn add_uguu(label: Option<String>) -> Result<()> {
+    let label = label.unwrap_or_else(|| format!("uguu-{}", chrono_like_label()));
+    let mut entries = load_providers()?;
+    entries.retain(|e| e["label"].as_str() != Some(&label));
+    entries.push(serde_json::json!({ "kind": "uguu", "label": label }));
+    save_providers(&entries)?;
+    println!("✓ added {label}");
+    Ok(())
+}
+
+fn read_line(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().lock().read_line(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
+fn chrono_like_label() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{n}")
 }

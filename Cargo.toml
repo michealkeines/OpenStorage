@@ -31,6 +31,8 @@ members = [
     "plugins/zerox_st",
     "plugins/telegram",
     "plugins/discord",
+    "plugins/telegraph",
+    "plugins/github_repo",
 ]
 
 [workspace.package]
@@ -99,6 +101,8 @@ os-plugin-fault-inject = { path = "plugins/fault_inject" }
 os-plugin-zeroxst = { path = "plugins/zerox_st" }
 os-plugin-telegram = { path = "plugins/telegram" }
 os-plugin-discord = { path = "plugins/discord" }
+os-plugin-telegraph = { path = "plugins/telegraph" }
+os-plugin-github-repo = { path = "plugins/github_repo" }
 
 [profile.dev]
 opt-level = 0

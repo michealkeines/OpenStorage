@@ -109,6 +109,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     host.register_chunk(provider_id, fault_plugin);
     persist_provider(&store, provider_id, plugin_id_str, label, trust_group)?;
 
+    // Multi-instance providers: every entry in the JSON file at the
+    // canonical secrets path (or $OPENSTORAGE_PROVIDERS override) becomes
+    // its own provider, registered under a fresh ProviderId with its own
+    // rate-limit middleware. This file is the **single source of truth**
+    // for authenticated backends — nothing in code embeds tokens.
+    let providers_path = std::env::var("OPENSTORAGE_PROVIDERS")
+        .ok()
+        .or_else(default_providers_path);
+    if let Some(path) = providers_path {
+        if std::path::Path::new(&path).exists() {
+            if let Err(e) = load_providers_file(&path, &host, &store).await {
+                tracing::warn!(error = %e, file = %path, "providers file load failed");
+            }
+        } else {
+            tracing::info!(file = %path, "no providers file yet (run `os auth add ...` to create entries)");
+        }
+    }
+
     // Also register a vault-provider role so the engine has somewhere to push
     // snapshots. The testbench's `HttpBackendPlugin` implements
     // `VaultPluginContract` (list / cas_write); the public-host
@@ -277,6 +295,198 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Canonical path for the secrets/providers file. Engine and CLI agree on
+/// this so `os auth add ...` (writes) and the engine's startup loader
+/// (reads) target the same file. The file is operator-owned, mode 0600,
+/// and never committed to source control.
+fn default_providers_path() -> Option<String> {
+    let dir = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| {
+            let mut p = std::path::PathBuf::from(h);
+            p.push("Library/Application Support/openstorage");
+            p
+        })
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(|a| {
+            let mut p = std::path::PathBuf::from(a);
+            p.push("openstorage");
+            p
+        })
+    } else {
+        // XDG: $XDG_CONFIG_HOME or ~/.config
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| {
+                    let mut p = std::path::PathBuf::from(h);
+                    p.push(".config");
+                    p
+                })
+            })
+            .map(|mut p| {
+                p.push("openstorage");
+                p
+            })
+    };
+    dir.map(|d| d.join("providers.json").to_string_lossy().into_owned())
+}
+
+/// Load `OPENSTORAGE_PROVIDERS` JSON and register every entry as its own
+/// provider. Each entry is `{ "kind": "...", "label": "...", "..." }`.
+/// Supported kinds: `telegraph`, `uguu`, `gofile`, `catbox`, `discord`,
+/// `telegram`. New kinds get added here as plugins land.
+async fn load_providers_file(
+    path: &str,
+    host: &Arc<Host>,
+    store: &Arc<Store>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = std::fs::read(path)?;
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
+    let mut counts: std::collections::HashMap<String, usize> = Default::default();
+    for entry in &entries {
+        let kind = entry["kind"].as_str().unwrap_or("?").to_string();
+        let label = entry["label"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{kind}-{}", counts.get(&kind).copied().unwrap_or(0) + 1));
+        let provider_id = ProviderId::new_v7();
+        let plugin: Arc<dyn PluginContract> = match kind.as_str() {
+            "telegraph" => {
+                let token = entry["access_token"].as_str().map(str::to_string);
+                let plugin = match token {
+                    Some(t) => os_plugin_telegraph::TelegraphPlugin::new(t, label.clone()),
+                    None => match os_plugin_telegraph::TelegraphPlugin::from_anonymous(
+                        label.clone(),
+                    )
+                    .await
+                    {
+                        Ok(p) => {
+                            tracing::info!(label = %label, "minted anonymous Telegraph account");
+                            p
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = ?e, label = %label, "telegraph mint failed; skipping");
+                            continue;
+                        }
+                    },
+                };
+                Arc::new(plugin)
+            }
+            "uguu" => Arc::new(os_plugin_zeroxst::ZeroxStPlugin::new()),
+            "github" => {
+                let owner = match entry["owner"].as_str() {
+                    Some(s) => s.to_string(),
+                    None => { tracing::warn!(label=%label, "github entry missing owner"); continue; }
+                };
+                let repo = match entry["repo"].as_str() {
+                    Some(s) => s.to_string(),
+                    None => { tracing::warn!(label=%label, "github entry missing repo"); continue; }
+                };
+                let branch = entry["branch"].as_str().unwrap_or("main").to_string();
+                let pat = match entry["access_token"].as_str() {
+                    Some(s) => s.to_string(),
+                    None => { tracing::warn!(label=%label, "github entry missing access_token"); continue; }
+                };
+                Arc::new(os_plugin_github_repo::GitHubRepoPlugin::new(owner, repo, branch, pat))
+            }
+            "telegram" => {
+                let token = match entry["bot_token"].as_str() {
+                    Some(t) => t.to_string(),
+                    None => {
+                        tracing::warn!("telegram entry missing bot_token; skipping");
+                        continue;
+                    }
+                };
+                let chat = match entry["chat_id"].as_str() {
+                    Some(c) => c.to_string(),
+                    None => {
+                        tracing::warn!("telegram entry missing chat_id; skipping");
+                        continue;
+                    }
+                };
+                Arc::new(os_plugin_telegram::TelegramPlugin::new(token, chat))
+            }
+            "discord" => {
+                let url = match entry["webhook_url"].as_str() {
+                    Some(u) => u.to_string(),
+                    None => {
+                        tracing::warn!("discord entry missing webhook_url; skipping");
+                        continue;
+                    }
+                };
+                Arc::new(os_plugin_discord::DiscordPlugin::new(url))
+            }
+            other => {
+                tracing::warn!(kind = %other, "unknown provider kind; skipping");
+                continue;
+            }
+        };
+        host.register_chunk(provider_id, plugin);
+        *counts.entry(kind.clone()).or_default() += 1;
+        let trust_group: &'static str = match kind.as_str() {
+            "telegraph" => "telegram-graph",
+            "uguu" => "uguu",
+            "github" => "github",
+            "telegram" => "telegram",
+            "discord" => "discord",
+            _ => "unknown",
+        };
+        let plugin_id_str: &'static str = match kind.as_str() {
+            "telegraph" => "org.openstorage.telegraph",
+            "uguu" => "org.openstorage.zeroxst",
+            "github" => "org.openstorage.github",
+            "telegram" => "org.openstorage.telegram",
+            "discord" => "org.openstorage.discord",
+            _ => "org.openstorage.unknown",
+        };
+        // We can't reuse persist_provider with a borrowed label since it
+        // expects &'static str. Inline a one-off persist.
+        persist_dynamic_provider(store, provider_id, plugin_id_str, &label, trust_group)?;
+        tracing::info!(provider_id = %provider_id, kind = %kind, label = %label, "registered provider");
+    }
+    let counts_str: String = counts
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!("providers loaded: {} ({counts_str})", entries.len());
+    Ok(())
+}
+
+fn persist_dynamic_provider(
+    store: &Store,
+    provider_id: ProviderId,
+    plugin_id: &str,
+    label: &str,
+    trust_group: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let provider = Provider {
+        provider_id,
+        plugin_id: PluginId::new(plugin_id),
+        instance_label: label.into(),
+        credentials_handle: CredentialsHandle::new(vec![])?,
+        capabilities: CapabilitySet::default(),
+        legal_class: LegalClass::Green,
+        trust_correlation_group: TrustCorrelationGroup::new(trust_group),
+        quota: QuotaState {
+            total: None,
+            used: None,
+            untrusted: false,
+        },
+        rate_limit: RateLimitState {
+            remaining: u32::MAX,
+            reset_at: Timestamp::from_string("now"),
+        },
+        health: HealthScore::new(1.0),
+        latency: LatencyProfile::default(),
+        untrusted_quota: false,
+    };
+    let mut txn = Txn::new();
+    store.put_provider(&mut txn, &provider)?;
+    store.commit(txn)?;
     Ok(())
 }
 

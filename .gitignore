@@ -40,6 +40,16 @@ downloaded.bin
 state.json
 state.json.bak.*
 
+# Provider/auth secrets — NEVER commit. The canonical file lives under the
+# user's config dir; these patterns catch any stray copy in-tree.
+providers.json
+providers.local.json
+providers.*.json
+!providers.example.json
+secrets.json
+secrets.*.json
+auth.json
+
 # ─── editors / IDE ────────────────────────────────────────────────────────
 .vscode/
 .idea/

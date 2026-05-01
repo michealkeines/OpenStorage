@@ -1393,9 +1393,11 @@ dependencies = [
  "os-metadata",
  "os-plugin-discord",
  "os-plugin-fault-inject",
+ "os-plugin-github-repo",
  "os-plugin-host",
  "os-plugin-http-backend",
  "os-plugin-telegram",
+ "os-plugin-telegraph",
  "os-plugin-zeroxst",
  "os-recovery",
  "os-repair",
@@ -1663,6 +1665,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-plugin-github-repo"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "hex",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "os-plugin-host"
 version = "0.1.0"
 dependencies = [
@@ -1710,6 +1729,21 @@ dependencies = [
  "os-types",
  "reqwest",
  "serde",
+ "tokio",
+]
+
+[[package]]
+name = "os-plugin-telegraph"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
