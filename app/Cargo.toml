@@ -1,0 +1,31 @@
+[package]
+name = "openstorage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openstorage"
+path = "src/main.rs"
+
+[dependencies]
+os-api = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+os-types = { workspace = true }
+os-crypto = { workspace = true }
+os-metadata = { workspace = true }
+os-wal = { workspace = true }
+os-sync = { workspace = true }
+os-vault = { workspace = true }
+os-vfs = { workspace = true }
+os-identity = { workspace = true }
+os-recovery = { workspace = true }
+os-plugin-host = { workspace = true }
+os-plugin-http-backend = { workspace = true }
+os-entities = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+axum = { workspace = true }

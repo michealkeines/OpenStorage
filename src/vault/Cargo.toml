@@ -1,0 +1,20 @@
+[package]
+name = "os-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+os-entities = { workspace = true }
+os-crypto = { workspace = true }
+os-metadata = { workspace = true }
+os-plugin-host = { workspace = true }
+os-merkle = { workspace = true }
+os-bloom = { workspace = true }
+os-events = { workspace = true }
+os-placement = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

@@ -517,7 +517,10 @@ WAL_ENTRY {
 | `OR_SET_REMOVE` | Observed-remove set remove (references `add_id`) | Revocation, removal from lists |
 | `COUNTER_INC` | Monotonic counter increment | Refcount, access count |
 | `MAP_PUT` / `MAP_DEL` | Sharded map update | Per-driver state |
-| `PATH_MOVE` | Atomic rename: linked OR_SET_REMOVE + OR_SET_ADD | File / directory rename |
+
+> **Namespace note.** The filesystem-shaped API (paths, `move`, `dirs`) is a *projection* of a flat FILE-record set, not a stored tree. `path` is a regular `LWW_REGISTER` field on the FILE record (keyed by stable `file_id`). Renames and moves are LWW writes to that field; directory listings are computed by prefix-grouping at read time. There is no `PATH_MOVE` composite op. See §5.8 ("Namespace Projection & Merge") for the projection rules and §6.13 for the read-time listing algorithm.
+>
+> This keeps the API and flows in §6 unchanged while making multi-device merge deterministic without a tree CRDT.
 
 All op kinds are commutative + associative + idempotent → multi-device merge is deterministic. See [`RESILIENCE.md`](./RESILIENCE.md) §3.1 for the full vocabulary and §2.B for resolution policies under concurrency.
 
@@ -624,6 +627,72 @@ See `PLUGIN_SDK.md` §6.
         │   LOST   │  (chunk-level alert; user notified per file)
         └──────────┘
 ```
+
+### 5.8 Namespace Projection & Merge
+
+The engine exposes a filesystem-shaped API (§ in `API.md` §8) — paths, `move`, `dirs`. Internally, it does **not** store a tree. It stores a flat collection of FILE records keyed by stable `file_id` (UUIDv7), each carrying a `path` field. The "tree" is computed at read time. This makes every namespace operation reduce to a CRDT primitive that already exists in §5.2.
+
+#### 5.8.1 Storage model
+
+```
+namespace = OR_SET<FILE_RECORD>
+  where each FILE_RECORD has:
+    file_id : UUIDv7         (stable identity — never changes for the life of the file)
+    path    : LWW_REGISTER   (the user-visible label; changes on rename/move)
+    …all other FILE fields…
+
+dirs = OR_SET<DIR_RECORD>
+  where each DIR_RECORD has:
+    dir_id  : UUIDv7
+    path    : LWW_REGISTER
+  (only used to persist *empty* directories — implicit dirs need no record)
+```
+
+There are no parent/child pointers. There is no "directory entry list." The relationship between a file and its directory is implied by string-prefix on `path`.
+
+#### 5.8.2 Operation → CRDT mapping
+
+| API operation | CRDT op(s) |
+|---|---|
+| `PUT /files/{path}` (new) | `OR_SET_ADD(namespace, FILE{file_id, path, …})` |
+| `PUT /files/{path}` (existing — chunk_list update) | `LWW_SET` on chunk_list of the matching FILE record |
+| `POST /files/{path}/move { to }` | `LWW_REGISTER` on `path` of the matching FILE record |
+| `POST /files/{path}/copy { to }` | new `file_id`; `OR_SET_ADD`; chunk_list shared (refcount++) |
+| `DELETE /files/{path}` | `OR_SET_REMOVE` on the matching FILE record |
+| `GET /dirs/{path}` | read-side prefix scan over namespace (see §6.13) |
+| `POST /dirs/{path}` | `OR_SET_ADD(dirs, DIR{dir_id, path})` |
+| `DELETE /dirs/{path}` (recursive) | batched `OR_SET_REMOVE` on every FILE/DIR with matching prefix at op HLC |
+
+`PATH_MOVE` is removed from the op vocabulary — it was a composite for a tree we no longer claim to have.
+
+#### 5.8.3 Merge rules
+
+**Rule N1 — `path` is `LWW_REGISTER`.** Concurrent renames of the same `file_id` are resolved by HLC. Loser's path value is overwritten. The file's content (chunk_list, AEAD blob, wrapped_keys) is unaffected.
+
+**Rule N2 — Same-path collision produces a deterministic conflict copy.** If, after merge, two distinct `file_id`s have identical `path` values, the LWW-loser's *rendered* path is:
+
+```
+  {original_path}.conflict-{loser_hlc}-{first_8_chars_of_loser_file_id}
+```
+
+The conflict path is a render-time projection — the stored `path` field is unchanged. Every device computes the identical conflict path because HLC and file_id are deterministic. The loser remains accessible via the conflict path until the user renames or deletes it; resolving the conflict path with `POST /files/{conflict_path}/move` updates the stored `path` field as a normal rename, and the conflict suffix disappears.
+
+**Rule N3 — Implicit directories.** A directory `D` appears in `GET /dirs/{parent}` if either:
+- any FILE record exists whose `path` starts with `{D}/`, OR
+- a DIR record exists with `path == D`.
+
+A FILE record whose path implies a directory whose explicit DIR record was tombstoned **resurrects** the directory (the file's existence wins over the dir's explicit deletion). This handles "device A moved file into /a/b; device B did rmdir /a/b concurrently" — the move wins; the dir is rendered.
+
+**Rule N4 — Recursive delete is per-file, scoped to op HLC.** `DELETE /dirs/{path}` (recursive) expands at op time to a batched `OR_SET_REMOVE` over every FILE/DIR record whose `path` starts with `{path}/` *as observed at the originating device's HLC*. Files added concurrently (causally independent of the recursive delete) are not removed by it; they survive at their declared path and resurrect the directory under Rule N3.
+
+#### 5.8.4 Properties this preserves
+
+- **Convergence**: all merge rules are functions of CRDT field values + HLC + stable file_id. Every device computes the same projection.
+- **No silent data loss**: same-path collision produces a conflict copy (visible, addressable), not silent overwrite. Concurrent rename produces one rendered name per file (no file lost).
+- **No tree-invariant violations possible at storage layer**: there are no tree invariants stored; orphans, cycles, and parentless-children cannot exist because parents are not pointers.
+- **API stability**: every flow in §6 keeps its current shape. Frontends (FUSE, app, CLI) see the same surface.
+
+The cost is a single user-visible artifact: occasional `*.conflict-...` files when two devices write to the same path while both offline. This is the same trade-off accepted by Dropbox, iCloud, Google Drive, Syncthing.
 
 ---
 
@@ -773,6 +842,10 @@ Frontend    API     VFS    Metadata    Read     Plugin Host   Backends   EC     
 - Take the first K to complete; cancel rest.
 - Per Dean & Barroso: in similar workloads this reduces 99.9p latency dramatically with ~2–5% extra requests.
 
+**Per-shard fault localization** (Invariant I2):
+- Each shard's AEAD tag is verified independently *before* EC decode. The AAD is `chunk_hash || shard_index` (§8.2), so a shard that is bit-rotted, substituted from a different chunk, substituted from a different slot, or returned by a hostile plugin fails AEAD unambiguously. The failing `(chunk_hash, shard_index)` is exactly the shard that needs repair.
+- After EC reconstruction, the recovered chunk plaintext is hashed and compared to `chunk.chunk_hash` (BLAKE3 or vault-salted, per §7.9). A mismatch here indicates a defense-in-depth failure (e.g., implementation bug producing wrong plaintext from authentic shards) — the chunk is marked LOST and the read fails with `chunk_integrity_violation` (Invariant I4).
+
 ### 6.5 Read Repair (inline)
 
 ```
@@ -794,6 +867,30 @@ During §6.4, if shard verify fails:
 Result: read completes from K healthy shards; degradation is repaired
 within seconds rather than waiting for next scheduled scrub.
 ```
+
+**Why per-shard repair targeting is unambiguous**: AEAD verification with AAD = `chunk_hash || shard_index` (§8.2) happens *per shard* and *before* EC decode. A failed AEAD identifies exactly one (chunk, slot) pair as the bad one — there is no triangulation problem. K shards that pass AEAD are by construction the right shards for this chunk in their respective slots; EC decode of K authentic shards is deterministic.
+
+**Insufficient-K branch** (fewer than K shards verify even after exhausting hedges):
+
+```
+If, after all K + H initial fetches and all reachable additional replicas have been tried,
+fewer than K shards pass AEAD verification:
+
+  Engine:
+    mark every failed shard DEGRADED + enqueue HIGH-priority repair
+    if no further replicas are reachable for the missing slots:
+      mark chunk replication_state = LOST
+      emit `chunk.lost` event referencing affected file(s) (Invariant I4)
+      fail the read with `chunk_unrecoverable`
+    else:
+      continue firing hedges; once K verify, complete the read normally
+
+  Subsequent reads of the same chunk see chunk_state = LOST and fail fast
+  until repair (from a remaining healthy replica or from a peer device's cache)
+  restores ≥ K healthy shards.
+```
+
+This is the cliff that triggers Invariant I4 ("no silent data loss"): the user is told *per file* which chunks are unrecoverable, rather than the read returning corrupted data or hanging.
 
 ### 6.6 Differential Snapshot
 
@@ -870,6 +967,49 @@ Crypto-shred MK → overwrite recovery manifest → best-effort delete on all ba
 ### 6.12 Plugin Sandboxed Call
 
 Engine → Plugin Host → enters WASM sandbox → plugin calls `signed_fetch(handle, request)` → host injects auth → fires HTTP on allowlisted host → response body returns to plugin → plugin returns ciphertext to engine. Tokens never leave host.
+
+### 6.13 Namespace Projection at Read Time
+
+Every namespace-shaped API call (`GET /dirs/{path}`, `HEAD /files/{path}`, path-targeted reads/writes/deletes) resolves through the same projection function. The engine never stores a tree — it computes one when asked.
+
+```
+project(query_path, kind):
+  # 1. Gather candidate FILE/DIR records by indexed prefix scan on `path` field
+  candidates = metadata.scan_by_path_prefix(query_path)
+
+  # 2. Apply same-path collision rule (§5.8.3 N2)
+  by_path : map<rendered_path, record>
+  for r in candidates:
+      rendered = r.path
+      if rendered already claimed by record r':
+          # HLC + file_id deterministically picks loser
+          loser, winner = order_by_hlc(r, r')
+          conflict_path = f"{loser.path}.conflict-{loser.hlc}-{loser.file_id[:8]}"
+          by_path[winner.path]   = winner
+          by_path[conflict_path] = loser
+      else:
+          by_path[rendered] = r
+
+  # 3. Apply implicit-directory rule (§5.8.3 N3)
+  if kind == DIR_LISTING:
+      direct_children    = entries directly under query_path
+      implicit_subdirs   = derived from FILE records with deeper prefix
+      explicit_subdirs   = DIR records with path == query_path/X
+      tombstoned_dirs    = explicit DIRs that were OR_SET_REMOVEd
+      # tombstoned dirs are resurrected if any FILE under them survives
+      return direct_children ∪ implicit_subdirs ∪ (explicit_subdirs − tombstoned_dirs_with_no_surviving_descendant)
+
+  if kind == FILE_LOOKUP:
+      return by_path[query_path]   # may be a winner OR a conflict-rendered loser
+```
+
+**Properties**:
+- **Deterministic**: every device with the same merged WAL produces the same projection. HLC + file_id break all ties.
+- **Idempotent**: repeated calls return identical results until a relevant op is applied.
+- **Cheap**: a path-prefix index on `FILE.path` (LSM secondary index) makes `GET /dirs/{path}` O(matches) plus a small constant for collision/dir-resurrection bookkeeping.
+- **Stable IDs**: `file_id` never changes across a rename, move, or copy of the path label. Sharing, recipient wraps, and external references key on `file_id`, not on `path`.
+
+Frontends consume this projection through the existing API; no frontend-side change is required relative to the prior tree-CRDT framing.
 
 ---
 

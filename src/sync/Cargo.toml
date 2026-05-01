@@ -1,0 +1,20 @@
+[package]
+name = "os-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+os-entities = { workspace = true }
+os-wal = { workspace = true }
+os-metadata = { workspace = true }
+os-crypto = { workspace = true }
+os-events = { workspace = true }
+thiserror = { workspace = true }
+ciborium = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+uuid = { workspace = true }

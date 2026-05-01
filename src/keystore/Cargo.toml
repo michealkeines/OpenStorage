@@ -1,0 +1,15 @@
+[package]
+name = "os-keystore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+os-crypto = { workspace = true }
+thiserror = { workspace = true }
+keyring = { workspace = true }
+zeroize = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }

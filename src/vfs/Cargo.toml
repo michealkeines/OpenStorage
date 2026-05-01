@@ -1,0 +1,31 @@
+[package]
+name = "os-vfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+os-entities = { workspace = true }
+os-metadata = { workspace = true }
+os-wal = { workspace = true }
+os-sync = { workspace = true }
+os-vault = { workspace = true }
+os-chunk = { workspace = true }
+os-placement = { workspace = true }
+os-plugin-host = { workspace = true }
+os-bloom = { workspace = true }
+os-events = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+ciborium = { workspace = true }
+os-crypto = { workspace = true }
+os-ec = { workspace = true }
+async-stream = "0.3"
+
+[dev-dependencies]
+rand = { workspace = true }
+uuid = { workspace = true }

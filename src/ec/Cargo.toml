@@ -1,0 +1,11 @@
+[package]
+name = "os-ec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+thiserror = { workspace = true }
+reed-solomon-erasure = { workspace = true }

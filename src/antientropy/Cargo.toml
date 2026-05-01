@@ -1,0 +1,18 @@
+[package]
+name = "os-antientropy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+os-entities = { workspace = true }
+os-vault = { workspace = true }
+os-plugin-host = { workspace = true }
+os-sync = { workspace = true }
+os-merkle = { workspace = true }
+os-events = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }

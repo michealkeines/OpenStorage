@@ -70,7 +70,11 @@ Every edge case identified across the design conversation, organized by domain, 
 **Resolution**: `LWW_SET` op kind. HLC ordering picks a winner. Both devices converge after merge. Intra-field concurrent edits don't fragment because each field is its own LWW register.
 
 #### 2.B.2 Concurrent renames (Device A renames /a → /b; Device B renames /a → /c)
-**Resolution**: the namespace is modeled as an OR-tree CRDT. A rename is `OR_SET_REMOVE(parent_dir, "a", cause=hlc_A) + OR_SET_ADD(parent_dir, ("b", file_id), cause=hlc_A)`. Concurrent renames produce two add records; HLC picks which is exposed. The losing rename is captured in a `concurrent_rename_history` log surfaced via the API so the user can review. *I6 preserved.*
+**Resolution**: the namespace is **not** a tree CRDT — it is a flat set of FILE records keyed by stable `file_id`, with `path` stored as `LWW_REGISTER` (see DESIGN.md §5.8). A rename is a single LWW write to the `path` field. Concurrent renames of the same `file_id` are resolved by HLC; the loser's path field is overwritten. File content (chunk_list, wrapped_keys) is unaffected. The user sees the file at one of the two names — the HLC-winner — on every device. No history log is needed; convergence is exact. *I6 preserved.*
+
+**Same-path collision** (two distinct `file_id`s end up with the same `path` after merge — e.g., A creates `/x` while B renames a different file to `/x`): the LWW-loser is *rendered* at a deterministic conflict path `{path}.conflict-{loser_hlc}-{file_id[:8]}` (DESIGN.md §5.8.3 Rule N2). Both files remain accessible; user resolves manually by renaming or deleting the conflict copy. *I5, I6 preserved.*
+
+**Move-into-deleted-directory** (A moves file F into /a/b; B deletes /a/b concurrently): the file's existence resurrects the directory (DESIGN.md §5.8.3 Rule N3). No orphan, no lost+found. *I6 preserved.*
 
 #### 2.B.3 Concurrent updates to the same chunk content (Case 6 from prior review)
 **Resolution**: **the missing fix**. Every `LWW_SET(shard:S.native_handle, …)` op carries a new field `previous_value` containing the handle the writer is replacing.
@@ -274,8 +278,9 @@ Every WAL entry uses one of these op kinds. The engine knows how to merge each.
 | `COUNTER_INC` | Monotonic counter increment. | Refcount, access count |
 | `MAP_PUT` | Add/update key in map. | Sharded metadata maps (per-driver state) |
 | `MAP_DEL` | Remove key from map; carries `add_id`. | Map removal |
-| `PATH_MOVE` | Atomic rename: REMOVE + ADD with linked cause. | File / directory rename |
-| `LWW_REGISTER` | Single-value register without previous_value (for fields that don't need shadow demotion). | Mode bits, content type, etc. |
+| `LWW_REGISTER` | Single-value register without previous_value (for fields that don't need shadow demotion). | Mode bits, content type, **path** (rename / move), etc. |
+
+> Rename and move operations are not a separate op kind — they are LWW writes to the `path` field of the FILE record. Same-path collisions render via the deterministic conflict-copy rule (DESIGN.md §5.8.3 N2). The namespace is a flat record set with prefix-projected directories; no tree CRDT is stored.
 
 `LWW_SET` (with `previous_value`) is mandatory for fields whose old values represent placed ciphertext (handle, driver_id). All other CRDT ops follow standard semantics.
 
@@ -428,7 +433,7 @@ Local staging buffer up to `cache.write_staging_max_bytes`. Writes are durable i
 | Plugin returns corrupted ciphertext | AEAD verify fail | Read repair from other replica | I2, I3 |
 | Plugin removed by user | Engine load-time check | Mark all shards LOST; user notified | I3, I4 |
 | Concurrent multi-device update | CRDT merge with `previous_value` | Demoted handle → shadow | I5, I6 |
-| Concurrent rename | OR-tree CRDT | HLC tiebreak; history retained | I6 |
+| Concurrent rename | LWW_REGISTER on FILE.path | HLC tiebreak; same-path collision → deterministic conflict copy (DESIGN §5.8) | I5, I6 |
 | Concurrent delete vs update | LWW on `exists` flag | Higher-HLC op wins; orphans shadowed | I5, I6 |
 | Vault provider rollback | Signed monotonic counter | Reject; promote replica | I7 |
 | All vault providers lost | Vault Manager error | Recovery materials → re-bind | (catastrophe path) |

@@ -1,0 +1,16 @@
+[package]
+name = "os-lease"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+os-entities = { workspace = true }
+os-crypto = { workspace = true }
+os-metadata = { workspace = true }
+os-events = { workspace = true }
+os-plugin-host = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

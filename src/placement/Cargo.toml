@@ -1,0 +1,13 @@
+[package]
+name = "os-placement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+os-entities = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }

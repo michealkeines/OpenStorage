@@ -1,0 +1,17 @@
+[package]
+name = "os-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+base32 = { workspace = true }
+zeroize = { workspace = true }
+blake3 = { workspace = true }

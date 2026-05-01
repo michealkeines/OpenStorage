@@ -1,1 +1,74 @@
-/target
+# ─── Rust ──────────────────────────────────────────────────────────────────
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# We commit Cargo.lock (workspace has binaries). Do NOT add it here.
+
+# ─── Python (testbench) ────────────────────────────────────────────────────
+testbench/.venv/
+testbench/__pycache__/
+testbench/**/__pycache__/
+testbench/**/*.pyc
+testbench/**/*.pyo
+testbench/.pytest_cache/
+testbench/.mypy_cache/
+testbench/.ruff_cache/
+
+# Testbench runtime state (encrypted-shard storage + comments)
+testbench/testbench-data/
+testbench-data/
+
+# ─── runtime / scratch ─────────────────────────────────────────────────────
+# Engine data dirs (WAL files, local KV, cached snapshots, binding files).
+/var/
+data/
+engine-data/
+openstorage-*/
+/tmp-*/
+
+# Test scratch and large generated payloads
+/scripts/scratch/
+*.payload
+*.payload.bin
+download.bin
+downloaded.bin
+*.bak.*
+
+# CLI state with persisted passphrase (developer-only).
+state.json
+state.json.bak.*
+
+# ─── editors / IDE ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+.DS_Store
+Thumbs.db
+
+# ─── env / secrets ────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+!secrets/.gitkeep
+
+# ─── coverage / profiling ─────────────────────────────────────────────────
+*.profraw
+*.profdata
+tarpaulin-report.html
+cobertura.xml
+flamegraph.svg
+perf.data
+perf.data.old
+
+# ─── tooling outputs ──────────────────────────────────────────────────────
+node_modules/
+*.log

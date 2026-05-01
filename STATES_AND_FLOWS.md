@@ -418,8 +418,8 @@ Every API operation gets a flow. Grouped by category; for each: trigger, precond
 #### F-FL-5: Rename / Move File
 
 - **Trigger**: `POST /v1/vaults/{v}/files/{src}/move` { to: dst }
-- **Flow**: `wal/`.append PathMove op; namespace tree updated atomically.
-- **Edges**: Concurrent rename — see F-MD-3.
+- **Flow**: `vfs/`.resolve `src` → FILE record (by stable `file_id`). `wal/`.append `LwwRegister(file.path, dst)`. No tree mutation — `path` is a regular LWW field on the FILE record (DESIGN.md §5.8). Directory listings update implicitly via prefix projection (DESIGN.md §6.13).
+- **Edges**: Concurrent rename of same `file_id` — see F-MD-3. Target path already claimed by a different `file_id` — see F-MD-3 same-path collision branch.
 
 #### F-FL-6: Peek (HEAD)
 
@@ -455,11 +455,11 @@ Every API operation gets a flow. Grouped by category; for each: trigger, precond
 
 #### F-MD-3: Concurrent Rename
 
-- **Flow**: PathMove ops with linked OR_SET ops. HLC ordering picks winner.
-- **Edges**:
-  - Loser's rename retained in `concurrent_rename_history` log per parent dir.
-  - Cycle attempt (A renamed to B, B renamed to A simultaneously): HLC tiebreak; one direction wins; history retains the other.
-  - Move into a deleted directory: linked op — child move applies; if parent dir deletion wins HLC, child is reparented to lost+found.
+- **Flow**: each device emits `LwwRegister(file.path, new_path)` on the same `file_id`. HLC orders the writes; LWW-loser's path field is overwritten on merge. File content (chunk_list, wrapped_keys, AEAD blob) is unaffected on either device.
+- **Same-`file_id` rename race** (A: F → /b; B: F → /c): HLC winner takes effect; loser's path value is dropped. The user sees F at one of the two names on every device. No history log; convergence is exact.
+- **Same-path collision** (A creates new file F1 at /x; B renames different file F2 to /x): both records survive at the storage layer (different `file_id`s). At read time, the projection function (DESIGN.md §6.13) detects the collision and renders the LWW-loser at `/x.conflict-{loser_hlc}-{file_id[:8]}`. Deterministic across devices. User resolves by renaming or deleting the conflict copy.
+- **Move-into-deleted-directory** (A: F → /a/b/F; B: rmdir /a/b concurrently): F's `path` LWW-write succeeds; the explicit DIR record for /a/b is OR_SET_REMOVEd by B. Implicit-directory rule (DESIGN.md §5.8.3 N3) resurrects /a/b at projection time because F's path requires it. No orphan, no lost+found.
+- **No cycle case to handle**: paths are strings, not parent pointers. Two files swapping path-shaped names produces two LWW writes on two different `file_id`s; both apply. No tree invariant exists to violate.
 
 #### F-MD-4: Lease Steal
 

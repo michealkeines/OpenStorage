@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>OpenStorage testbench</title>
+  <style>
+    :root {
+      --bg: #0f1115; --fg: #e6e6e6; --muted: #8a8f99;
+      --accent: #66d9ef; --accent2: #a6e22e; --warn: #f92672;
+      --border: #2a2e36;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", monospace;
+      background: var(--bg); color: var(--fg);
+    }
+    header { padding: 18px 24px; border-bottom: 1px solid var(--border); }
+    header h1 { margin: 0 0 4px; font-size: 18px; color: var(--accent); }
+    header .sub { color: var(--muted); font-size: 12px; }
+    main { padding: 24px; max-width: 1100px; margin: 0 auto; display: grid;
+           grid-template-columns: 1fr 1fr; gap: 24px; }
+    section { background: #14171d; border: 1px solid var(--border); border-radius: 6px;
+              padding: 16px; }
+    section h2 { margin: 0 0 12px; font-size: 14px; color: var(--accent2);
+                 letter-spacing: 0.04em; text-transform: uppercase; }
+    textarea, input[type=text] {
+      width: 100%; background: #0a0c10; color: var(--fg);
+      border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px;
+      font: inherit;
+    }
+    textarea { min-height: 90px; resize: vertical; }
+    button { background: var(--accent); color: #04060a; border: none; padding: 8px 14px;
+             border-radius: 4px; cursor: pointer; font-weight: 600; }
+    button.secondary { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+    button.danger { background: var(--warn); color: #fff; }
+    .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+    .stack { display: flex; flex-direction: column; gap: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    code { background: #0a0c10; padding: 1px 4px; border-radius: 2px; }
+    .stat { display: flex; justify-content: space-between; padding: 4px 0; }
+    .stat .k { color: var(--muted); }
+    .ts { color: var(--muted); font-size: 11px; }
+    .comment { border-left: 2px solid var(--accent); padding: 4px 10px; margin: 8px 0;
+               background: #0a0c10; }
+    .comment .author { color: var(--accent); font-weight: 600; }
+    footer { color: var(--muted); padding: 12px 24px; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>openstorage testbench</h1>
+    <div class="sub">A backend object store with a comments box. Used as a chunk-storage backend by the openstorage HTTP-backend plugin.</div>
+  </header>
+  <main>
+    <section>
+      <h2>Comments</h2>
+      <p style="color:var(--muted); font-size: 12px; margin-top:0;">
+        Operators can leave notes here. Comments are stored on this server in
+        <code>comments.json</code> and round-trip through the same code path as objects.
+      </p>
+      <div class="stack">
+        <input id="author" type="text" placeholder="author (optional)">
+        <textarea id="body" placeholder="comment text"></textarea>
+        <div class="row">
+          <button id="postComment">post comment</button>
+          <button id="reload" class="secondary">refresh</button>
+        </div>
+      </div>
+      <div id="comments"></div>
+    </section>
+
+    <section>
+      <h2>Backend status</h2>
+      <div id="health" class="stack"></div>
+      <h2 style="margin-top:18px">Stored objects</h2>
+      <p style="color:var(--muted); font-size:12px; margin-top:0;">
+        These are the AEAD-encrypted chunk shards put here by the openstorage engine. We
+        cannot decrypt them — only the engine has the keys. Listed for visibility.
+      </p>
+      <div id="objects"></div>
+    </section>
+  </main>
+  <footer>
+    PUT/GET/HEAD/DELETE/LIST under <code>/v1/objects</code>. Comments under <code>/v1/comments</code>. Health at <code>/v1/health</code>.
+  </footer>
+
+  <script>
+    const $ = (s) => document.querySelector(s);
+
+    async function loadComments() {
+      const r = await fetch('/v1/comments').then(r => r.json());
+      const container = $('#comments');
+      container.innerHTML = '';
+      for (const c of r.comments) {
+        const div = document.createElement('div');
+        div.className = 'comment';
+        const t = new Date(c.at * 1000).toISOString().replace('T', ' ').slice(0, 19);
+        div.innerHTML = `<div><span class="author">${esc(c.author)}</span> <span class="ts">${t}</span></div>
+                         <div>${esc(c.body)}</div>`;
+        container.appendChild(div);
+      }
+    }
+
+    async function loadHealth() {
+      const r = await fetch('/v1/health').then(r => r.json());
+      $('#health').innerHTML =
+        `<div class="stat"><span class="k">state</span><span>${r.state}</span></div>
+         <div class="stat"><span class="k">data dir</span><span><code>${r.data_dir}</code></span></div>
+         <div class="stat"><span class="k">object count</span><span>${r.object_count}</span></div>
+         <div class="stat"><span class="k">used bytes</span><span>${fmtBytes(r.used_bytes)}</span></div>`;
+    }
+
+    async function loadObjects() {
+      const r = await fetch('/v1/objects?limit=200').then(r => r.json());
+      const container = $('#objects');
+      if (!r.objects.length) {
+        container.innerHTML = '<div style="color:var(--muted); font-size:12px;">no objects yet</div>';
+        return;
+      }
+      let html = '<table><thead><tr><th>handle</th><th>size</th><th>stored at</th></tr></thead><tbody>';
+      for (const o of r.objects) {
+        const t = new Date(o.stored_at * 1000).toISOString().replace('T', ' ').slice(0, 19);
+        html += `<tr><td><code>${esc(o.handle)}</code></td><td>${fmtBytes(o.size)}</td><td class="ts">${t}</td></tr>`;
+      }
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    }
+
+    function fmtBytes(n) {
+      if (n < 1024) return `${n} B`;
+      if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+      if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+      return `${(n / 1073741824).toFixed(2)} GB`;
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[c]);
+    }
+
+    $('#postComment').onclick = async () => {
+      const author = $('#author').value || null;
+      const body = $('#body').value.trim();
+      if (!body) return;
+      await fetch('/v1/comments', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({author, body}),
+      });
+      $('#body').value = '';
+      await loadComments();
+    };
+
+    $('#reload').onclick = async () => {
+      await Promise.all([loadComments(), loadHealth(), loadObjects()]);
+    };
+
+    (async () => {
+      await Promise.all([loadComments(), loadHealth(), loadObjects()]);
+      setInterval(loadHealth, 5000);
+      setInterval(loadObjects, 5000);
+    })();
+  </script>
+</body>
+</html>

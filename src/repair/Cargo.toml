@@ -1,0 +1,17 @@
+[package]
+name = "os-repair"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+os-types = { workspace = true }
+os-entities = { workspace = true }
+os-metadata = { workspace = true }
+os-plugin-host = { workspace = true }
+os-placement = { workspace = true }
+os-chunk = { workspace = true }
+os-events = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
