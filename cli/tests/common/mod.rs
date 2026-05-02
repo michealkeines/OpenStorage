@@ -55,6 +55,13 @@ pub async fn spawn_engine() -> Engine {
     let repair = Arc::new(RepairScheduler::new(1024));
     let events = Arc::new(EventBus::new());
     let share = Arc::new(ShareService::new(store, vfs.clone()));
+    let oauth = Arc::new(os_plugin_host::lifecycle::OAuthCoordinator::new());
+    let plugin_authors = Arc::new(std::sync::RwLock::new(
+        std::collections::HashMap::new(),
+    ));
+    let plugin_capabilities = Arc::new(std::sync::RwLock::new(
+        std::collections::HashMap::new(),
+    ));
     let app = router(AppState {
         recovery,
         vault,
@@ -65,6 +72,9 @@ pub async fn spawn_engine() -> Engine {
         events,
         host,
         share,
+        oauth,
+        plugin_authors,
+        plugin_capabilities,
         device_id,
         fault: None,
         plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

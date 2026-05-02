@@ -21,6 +21,8 @@ tracing = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true }

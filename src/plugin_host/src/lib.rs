@@ -12,6 +12,7 @@
 pub mod contract;
 pub mod host;
 pub mod http;
+pub mod lifecycle;
 pub mod local_dir;
 pub mod pool;
 pub mod rate_limit;

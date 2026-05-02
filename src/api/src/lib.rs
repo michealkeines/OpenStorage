@@ -31,6 +31,9 @@ use os_identity::IdentityService;
 use os_lease::LeaseService;
 use os_plugin_host::Host;
 use os_recovery::RecoveryService;
+use os_plugin_host::lifecycle::{
+    self as plug_lifecycle, OAuthCoordinator, PluginManifest, UserConfirmation,
+};
 use os_repair::RepairScheduler;
 use os_share::{
     decode_blob as share_decode_blob, encode_blob as share_encode_blob,
@@ -51,6 +54,16 @@ pub struct AppState {
     pub events: Arc<EventBus>,
     pub host: Arc<Host>,
     pub share: Arc<ShareService>,
+    /// F-PL — plugin lifecycle.
+    pub oauth: Arc<OAuthCoordinator>,
+    /// F-PL-1 TOFU — known author keys keyed by `plugin_id` so subsequent
+    /// installs detect rotation.
+    pub plugin_authors: Arc<std::sync::RwLock<std::collections::HashMap<os_types::PluginId, os_types::Ed25519Pub>>>,
+    /// F-PL-3 — last observed capability set per plugin instance, used
+    /// to compute drift on reload.
+    pub plugin_capabilities: Arc<
+        std::sync::RwLock<std::collections::HashMap<os_types::PluginId, os_types::CapabilitySet>>,
+    >,
     pub device_id: os_types::DeviceId,
     /// Optional fault handle for integration tests.
     pub fault: Option<FaultHandleAny>,
@@ -152,6 +165,10 @@ pub fn router(state: AppState) -> Router {
                 .delete(delete_file),
         )
         .route("/v1/vaults/:vault_id/dirs", get(list_dir))
+        .route("/v1/plugins/install", post(install_plugin_route))
+        .route("/v1/plugins/:plugin_id/reload", post(reload_plugin_route))
+        .route("/v1/providers/oauth/start", post(oauth_start_route))
+        .route("/v1/providers/oauth/complete", post(oauth_complete_route))
         .route("/v1/system/scrub", post(system_scrub))
         .route("/v1/system/gc", post(system_gc))
         .route("/v1/vaults/:vault_id/rebalance", post(system_rebalance))
@@ -1633,6 +1650,171 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ─── F-PL-1 install / F-PL-3 reload ──────────────────────────────────────
+
+#[derive(Deserialize)]
+struct InstallPluginReq {
+    /// Hex-encoded CBOR `PluginManifest`.
+    manifest_hex: String,
+    /// "confirm" (Green/Amber) or "double" (Red).
+    confirmation: String,
+}
+
+async fn install_plugin_route(
+    State(s): State<AppState>,
+    Json(req): Json<InstallPluginReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let bytes = hex_decode(&req.manifest_hex).ok_or_else(|| ApiError::bad("manifest_hex"))?;
+    let manifest: PluginManifest =
+        ciborium::from_reader(&bytes[..]).map_err(|e| ApiError::bad(format!("decode: {e}")))?;
+    let confirmation = match req.confirmation.as_str() {
+        "confirm" => UserConfirmation::Confirm,
+        "double" => UserConfirmation::DoubleConfirm,
+        other => return Err(ApiError::bad(format!("unknown confirmation: {other}"))),
+    };
+    let prior = s
+        .plugin_authors
+        .read()
+        .expect("plugin_authors")
+        .get(&manifest.plugin_id)
+        .cloned();
+    plug_lifecycle::verify_install(&manifest, prior.as_ref(), confirmation).map_err(|e| match e {
+        plug_lifecycle::LifecycleError::SignatureInvalid => ApiError::unauth(format!("install: {e}")),
+        plug_lifecycle::LifecycleError::AuthorRotated => ApiError::conflict(format!("install: {e}")),
+        plug_lifecycle::LifecycleError::RedLegalClassUnconfirmed => {
+            ApiError::bad(format!("install: {e}"))
+        }
+        other => ApiError::bad(format!("install: {other}")),
+    })?;
+    // Record TOFU author + initial capabilities for drift detection.
+    s.plugin_authors
+        .write()
+        .expect("plugin_authors")
+        .insert(manifest.plugin_id.clone(), manifest.author_pubkey);
+    s.plugin_capabilities
+        .write()
+        .expect("plugin_capabilities")
+        .insert(
+            manifest.plugin_id.clone(),
+            manifest.requested_capabilities.clone(),
+        );
+    Ok(Json(serde_json::json!({
+        "plugin_id": manifest.plugin_id.0,
+        "version": manifest.version,
+        "state": "loaded",
+    })))
+}
+
+#[derive(Deserialize)]
+struct ReloadPluginReq {
+    /// Hex-encoded CBOR `CapabilitySet` reflecting the new manifest's
+    /// declared capabilities.
+    capabilities_hex: String,
+}
+
+async fn reload_plugin_route(
+    State(s): State<AppState>,
+    Path(plugin_id): Path<String>,
+    Json(req): Json<ReloadPluginReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let pid = os_types::PluginId::new(plugin_id);
+    let bytes =
+        hex_decode(&req.capabilities_hex).ok_or_else(|| ApiError::bad("capabilities_hex"))?;
+    let new_caps: os_types::CapabilitySet =
+        ciborium::from_reader(&bytes[..]).map_err(|e| ApiError::bad(format!("decode: {e}")))?;
+    let prev = s
+        .plugin_capabilities
+        .read()
+        .expect("plugin_capabilities")
+        .get(&pid)
+        .cloned();
+    let prev = match prev {
+        Some(p) => p,
+        None => return Err(ApiError::not_found("plugin not installed")),
+    };
+    let diff = plug_lifecycle::diff_capabilities(&prev, &new_caps);
+    let needs_decision = !diff.lost.is_empty();
+    s.plugin_capabilities
+        .write()
+        .expect("plugin_capabilities")
+        .insert(pid.clone(), new_caps);
+    let state_after = if needs_decision {
+        s.events
+            .publish(os_events::Event::new("plugin.confirmation_required"));
+        "awaiting_user_decision"
+    } else {
+        "active"
+    };
+    Ok(Json(serde_json::json!({
+        "plugin_id": pid.0,
+        "gained": diff.gained,
+        "lost": diff.lost,
+        "state": state_after,
+    })))
+}
+
+// ─── F-PL-2 OAuth ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct OAuthStartReq {
+    plugin_id: String,
+    auth_url: String,
+    #[serde(default)]
+    required_scopes: Vec<String>,
+}
+
+async fn oauth_start_route(
+    State(s): State<AppState>,
+    Json(req): Json<OAuthStartReq>,
+) -> Json<serde_json::Value> {
+    let session = s.oauth.start(
+        os_types::PluginId::new(req.plugin_id),
+        req.auth_url,
+        req.required_scopes,
+    );
+    Json(serde_json::json!({
+        "state": session.state,
+        "auth_url": session.auth_url,
+    }))
+}
+
+#[derive(Deserialize)]
+struct OAuthCompleteReq {
+    state: String,
+    /// Hex-encoded raw token bytes (the OAuth `access_token`).
+    token_hex: String,
+    granted_scopes: Vec<String>,
+}
+
+async fn oauth_complete_route(
+    State(s): State<AppState>,
+    Json(req): Json<OAuthCompleteReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = hex_decode(&req.token_hex).ok_or_else(|| ApiError::bad("token_hex"))?;
+    let mk = s
+        .vault
+        .master_key()
+        .ok_or_else(|| ApiError::locked("oauth: vault must be Unlocked"))?;
+    let mk_sym = os_crypto::SymKey::from_bytes(*mk.as_bytes());
+    let (session, cred) = s
+        .oauth
+        .complete(&req.state, &token, &req.granted_scopes, &mk_sym)
+        .map_err(|e| match e {
+            plug_lifecycle::LifecycleError::OAuthSessionNotFound => {
+                ApiError::not_found("oauth session")
+            }
+            plug_lifecycle::LifecycleError::OAuthInsufficientScope { .. } => {
+                ApiError::bad(format!("oauth: {e}"))
+            }
+            other => ApiError::bad(format!("oauth: {other}")),
+        })?;
+    Ok(Json(serde_json::json!({
+        "plugin_id": session.plugin_id.0,
+        "credentials_handle_hex": hex::encode(cred.as_bytes()),
+        "state": "ready",
+    })))
+}
+
 async fn get_fault(State(s): State<AppState>) -> Json<serde_json::Value> {
     if let Some(f) = &s.fault {
         return Json((f.snapshot)());
@@ -1785,6 +1967,13 @@ mod tests {
         let repair = Arc::new(os_repair::RepairScheduler::new(1024));
         let events = Arc::new(os_events::EventBus::new());
         let share = Arc::new(os_share::ShareService::new(store, vfs.clone()));
+        let oauth = Arc::new(os_plugin_host::lifecycle::OAuthCoordinator::new());
+        let plugin_authors = Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        ));
+        let plugin_capabilities = Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        ));
         router(AppState {
             recovery,
             vault,
@@ -1795,6 +1984,9 @@ mod tests {
             events,
             host,
             share,
+            oauth,
+            plugin_authors,
+            plugin_capabilities,
             device_id,
             fault: None,
             plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -2564,6 +2756,9 @@ mod tests {
             events,
             host,
             share,
+            oauth: Arc::new(os_plugin_host::lifecycle::OAuthCoordinator::new()),
+            plugin_authors: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            plugin_capabilities: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             device_id,
             fault: None,
             plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -2798,6 +2993,204 @@ mod tests {
         assert_eq!(gc.status(), StatusCode::OK);
     }
 
+    /// F-PL-1 — install plugin happy path: signed manifest accepted,
+    /// the second install with the same author succeeds, an install
+    /// with a tampered manifest is refused.
+    #[tokio::test]
+    async fn plugin_install_signature_and_tofu() {
+        use os_crypto::{generate_keypair, sign};
+        let app = build_app();
+        let (sk, pk) = generate_keypair(&mut OsRng);
+        let mut manifest = os_plugin_host::lifecycle::PluginManifest {
+            plugin_id: os_types::PluginId::new("org.test.signed"),
+            version: "1.0.0".into(),
+            author_pubkey: pk,
+            legal_class: os_types::LegalClass::Green,
+            requested_capabilities: os_types::CapabilitySet::default()
+                .with(os_types::Capability::Put)
+                .with(os_types::Capability::Get),
+            source_url: "https://example.com/p.wasm".into(),
+            signature: os_types::Ed25519Sig([0u8; 64]),
+        };
+        let mut canon = Vec::new();
+        ciborium::into_writer(&manifest, &mut canon).unwrap();
+        manifest.signature = sign(&sk, &canon);
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&manifest, &mut bytes).unwrap();
+        let body = serde_json::json!({
+            "manifest_hex": hex::encode(&bytes),
+            "confirmation": "confirm",
+        });
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/plugins/install")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // Tampered manifest with the same plugin_id but a different
+        // signature → 401.
+        let mut tampered = manifest.clone();
+        tampered.version = "9.9.9".into();
+        let mut tb = Vec::new();
+        ciborium::into_writer(&tampered, &mut tb).unwrap();
+        let body = serde_json::json!({
+            "manifest_hex": hex::encode(&tb),
+            "confirmation": "confirm",
+        });
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/plugins/install")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// F-PL-2 — OAuth start/complete round-trip yields a credentials
+    /// handle the engine can store.
+    #[tokio::test]
+    async fn plugin_oauth_round_trip() {
+        let app = build_app();
+        let _ = create_vault_for_test(&app).await;
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/providers/oauth/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "plugin_id": "org.test.oauth",
+                            "auth_url": "https://provider/authorize",
+                            "required_scopes": ["files.write"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(start.into_body(), 8192).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let state = parsed["state"].as_str().unwrap().to_string();
+
+        let complete = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/providers/oauth/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "state": state,
+                            "token_hex": hex::encode("access-token-bytes"),
+                            "granted_scopes": ["files.write", "files.read"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(complete.into_body(), 8192)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["credentials_handle_hex"].as_str().is_some());
+    }
+
+    /// F-PL-3 — capability drift on reload: lost capability transitions
+    /// to AwaitingUserDecision.
+    #[tokio::test]
+    async fn plugin_capability_drift_marks_awaiting_user_decision() {
+        use os_crypto::{generate_keypair, sign};
+        let app = build_app();
+        let (sk, pk) = generate_keypair(&mut OsRng);
+        let mut manifest = os_plugin_host::lifecycle::PluginManifest {
+            plugin_id: os_types::PluginId::new("org.test.drift"),
+            version: "1.0.0".into(),
+            author_pubkey: pk,
+            legal_class: os_types::LegalClass::Green,
+            requested_capabilities: os_types::CapabilitySet::default()
+                .with(os_types::Capability::Put)
+                .with(os_types::Capability::Get)
+                .with(os_types::Capability::Tombstone),
+            source_url: "https://example.com/p.wasm".into(),
+            signature: os_types::Ed25519Sig([0u8; 64]),
+        };
+        let mut canon = Vec::new();
+        ciborium::into_writer(&manifest, &mut canon).unwrap();
+        manifest.signature = sign(&sk, &canon);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&manifest, &mut bytes).unwrap();
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/plugins/install")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "manifest_hex": hex::encode(&bytes),
+                            "confirmation": "confirm",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let new_caps = os_types::CapabilitySet::default()
+            .with(os_types::Capability::Put)
+            .with(os_types::Capability::Get);
+        let mut cb = Vec::new();
+        ciborium::into_writer(&new_caps, &mut cb).unwrap();
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/plugins/org.test.drift/reload")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "capabilities_hex": hex::encode(&cb),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), 8192).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["state"].as_str().unwrap(), "awaiting_user_decision");
+        assert!(parsed["lost"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("Tombstone")));
+    }
+
     /// F-MD-4 — `try_steal` while the lease is still live returns 409.
     /// After 2×TTL has elapsed the steal succeeds, and the prior holder's
     /// renew returns 410 Gone.
@@ -2843,6 +3236,9 @@ mod tests {
             events: events.clone(),
             host: host.clone(),
             share: share.clone(),
+            oauth: Arc::new(os_plugin_host::lifecycle::OAuthCoordinator::new()),
+            plugin_authors: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            plugin_capabilities: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             device_id: dev_a,
             fault: None,
             plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -2857,6 +3253,9 @@ mod tests {
             events,
             host,
             share,
+            oauth: Arc::new(os_plugin_host::lifecycle::OAuthCoordinator::new()),
+            plugin_authors: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            plugin_capabilities: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             device_id: dev_b,
             fault: None,
             plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

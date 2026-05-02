@@ -181,6 +181,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: FaultCmd,
     },
+    /// F-PL — plugin install / oauth / capability drift.
+    Plugins {
+        #[command(subcommand)]
+        cmd: PluginsCmd,
+    },
     /// Plugin-state machine transitions.
     PluginState {
         #[command(subcommand)]
@@ -273,6 +278,42 @@ enum FaultCmd {
     },
     /// Clear all fault counters and unpause.
     Clear,
+}
+
+#[derive(Subcommand, Debug)]
+enum PluginsCmd {
+    /// F-PL-1 — install a signed plugin manifest.
+    Install {
+        #[arg(long)]
+        manifest_hex: String,
+        /// "confirm" or "double" (red legal_class needs double).
+        #[arg(long, default_value = "confirm")]
+        confirmation: String,
+    },
+    /// F-PL-3 — push a new capability set after a plugin reload.
+    Reload {
+        plugin_id: String,
+        #[arg(long)]
+        capabilities_hex: String,
+    },
+    /// F-PL-2 — start an OAuth flow.
+    OauthStart {
+        #[arg(long)]
+        plugin_id: String,
+        #[arg(long)]
+        auth_url: String,
+        #[arg(long, value_delimiter = ',')]
+        scope: Vec<String>,
+    },
+    /// F-PL-2 — complete an OAuth flow with the access token.
+    OauthComplete {
+        #[arg(long)]
+        state: String,
+        #[arg(long)]
+        token_hex: String,
+        #[arg(long, value_delimiter = ',')]
+        granted: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -498,6 +539,7 @@ async fn main() -> Result<()> {
         Cmd::Shares { cmd } => shares_cmd(&client, &cli.base, cmd).await,
         Cmd::Events { limit } => events_tail(&client, &cli.base, limit).await,
         Cmd::Fault { cmd } => fault_cmd(&client, &cli.base, cmd).await,
+        Cmd::Plugins { cmd } => plugins_cmd(&client, &cli.base, cmd).await,
         Cmd::PluginState { cmd } => plugin_state_cmd(&client, &cli.base, cmd).await,
         Cmd::Auth { cmd } => auth_cmd(&client, cmd).await,
     }
@@ -1480,6 +1522,75 @@ async fn fault_cmd(client: &reqwest::Client, base: &str, cmd: FaultCmd) -> Resul
                 bail!("clear failed: {}", resp.status());
             }
             println!("✓ fault cleared");
+        }
+    }
+    Ok(())
+}
+
+async fn plugins_cmd(client: &reqwest::Client, base: &str, cmd: PluginsCmd) -> Result<()> {
+    match cmd {
+        PluginsCmd::Install { manifest_hex, confirmation } => {
+            let resp = client
+                .post(format!("{base}/v1/plugins/install"))
+                .json(&serde_json::json!({
+                    "manifest_hex": manifest_hex,
+                    "confirmation": confirmation,
+                }))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("install failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ plugin installed: {}", serde_json::to_string_pretty(&body)?);
+        }
+        PluginsCmd::Reload { plugin_id, capabilities_hex } => {
+            let resp = client
+                .post(format!("{base}/v1/plugins/{plugin_id}/reload"))
+                .json(&serde_json::json!({"capabilities_hex": capabilities_hex}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                bail!("reload failed: {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ plugin reloaded: {}", serde_json::to_string_pretty(&body)?);
+        }
+        PluginsCmd::OauthStart { plugin_id, auth_url, scope } => {
+            let resp = client
+                .post(format!("{base}/v1/providers/oauth/start"))
+                .json(&serde_json::json!({
+                    "plugin_id": plugin_id,
+                    "auth_url": auth_url,
+                    "required_scopes": scope,
+                }))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                bail!("oauth start failed: {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ oauth session: {}", serde_json::to_string_pretty(&body)?);
+        }
+        PluginsCmd::OauthComplete { state, token_hex, granted } => {
+            let resp = client
+                .post(format!("{base}/v1/providers/oauth/complete"))
+                .json(&serde_json::json!({
+                    "state": state,
+                    "token_hex": token_hex,
+                    "granted_scopes": granted,
+                }))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("oauth complete failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ credentials wrapped: {}", serde_json::to_string_pretty(&body)?);
         }
     }
     Ok(())

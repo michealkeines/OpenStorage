@@ -40,6 +40,7 @@ os-plugin-host = { path = "../src/plugin_host" }
 os-recovery = { path = "../src/recovery" }
 os-repair = { path = "../src/repair" }
 os-share = { path = "../src/share" }
+ciborium = { workspace = true }
 os-sync = { path = "../src/sync" }
 os-types = { path = "../src/types" }
 os-vault = { path = "../src/vault" }
