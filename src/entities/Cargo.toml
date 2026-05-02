@@ -11,3 +11,8 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+rand = { workspace = true }
+uuid = { workspace = true }

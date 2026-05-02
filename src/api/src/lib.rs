@@ -728,6 +728,20 @@ async fn rotate_identity_route(
     State(s): State<AppState>,
     Path(_vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Layer 4 / §6.A.6 — identity rotation is the *one* hard
+    // serialization point. Two devices rotating concurrently would
+    // produce competing epoch_n+1 records; an HLC tiebreak is unsafe
+    // because the loser may have already published their new pubkey
+    // out of band. Lease enforcement avoids this by serializing.
+    let lease = s.lease.current().ok_or_else(|| {
+        ApiError::conflict("identity rotation requires the vault lease (none held)")
+    })?;
+    if lease.holder_device_id != s.device_id {
+        return Err(ApiError::conflict(format!(
+            "identity rotation requires the lease; held by another device {}",
+            lease.holder_device_id
+        )));
+    }
     // Find the only identity (single-user vault).
     let store = s.identity.store();
     let backend = store.backend();
@@ -1612,6 +1626,74 @@ async fn process_repair_task(
             // beyond logging.
             Ok(())
         }
+        RepairSource::PluginBan => {
+            // Layer 2 — a provider was Banned by `HealthMonitor`. For
+            // every shard of this chunk hosted on a Banned provider:
+            // register a `Shadow` (so the residual report counts the
+            // bytes), drop the shard from the chunk's `shard_list`, and
+            // mark the chunk Degraded. Re-placement onto a healthy
+            // provider is a Layer 4 closure — for now we shed the
+            // banned shards and let the existing healthy replicas serve
+            // reads.
+            let mut surviving: Vec<os_types::ShardId> = Vec::with_capacity(chunk.shard_list.len());
+            let mut shadowed: Vec<os_entities::Shadow> = Vec::new();
+            for shard_id in &chunk.shard_list {
+                let shard = match store.get_shard(*shard_id) {
+                    Ok(Some(sh)) => sh,
+                    _ => {
+                        continue;
+                    }
+                };
+                let provider = shard.driver_id.value;
+                if s.host.provider_health(provider).is_banned() {
+                    use os_entities::{Shadow, ShadowReason, ShadowState};
+                    use os_types::CachedElsewhereRisk;
+                    shadowed.push(Shadow {
+                        shadow_id: os_types::ShadowId::new_v7(),
+                        original_chunk_hash: chunk.chunk_hash,
+                        driver_id: provider,
+                        native_handle: shard.native_handle.value.clone(),
+                        ciphertext_length: shard.ciphertext_length,
+                        abandoned_at: os_types::Timestamp::from_string(&repair_now_iso()),
+                        reason: ShadowReason::PluginBanned,
+                        cached_elsewhere_risk: CachedElsewhereRisk::High,
+                        counts_against_quota: true,
+                        tombstone_clears_at: None,
+                        state: ShadowState::Registered,
+                        peek_count: 0,
+                    });
+                } else {
+                    surviving.push(*shard_id);
+                }
+            }
+            if shadowed.is_empty() {
+                return Ok(());
+            }
+            let mut txn = os_metadata::Txn::new();
+            for sh in &shadowed {
+                store
+                    .put_shadow(&mut txn, sh)
+                    .map_err(|e| format!("put_shadow: {e}"))?;
+            }
+            // Drop banned shards from the chunk's shard list and
+            // mark Degraded.
+            let mut updated_chunk = chunk.clone();
+            updated_chunk.shard_list = surviving;
+            updated_chunk.replication_state = if updated_chunk.shard_list.is_empty() {
+                os_entities::ReplicationState::Lost
+            } else {
+                os_entities::ReplicationState::Degraded
+            };
+            store
+                .put_chunk(&mut txn, &updated_chunk)
+                .map_err(|e| format!("put_chunk: {e}"))?;
+            store
+                .commit(txn)
+                .map_err(|e| format!("commit: {e}"))?;
+            s.events
+                .publish(os_events::Event::new("plugin.banned"));
+            Ok(())
+        }
     }
 }
 
@@ -2231,12 +2313,22 @@ async fn push_snapshot_route(
     let etag = os_crypto::blake3_32(&blob);
     let snapshot_id = blob[..12].to_vec();
 
-    // Push to the first registered vault provider via the universal
-    // `put` API (handle-based), then verify by peeking the returned
-    // handle. The signed-pointer CAS happens on the local Vault record
-    // — the on-plugin pointer would need a name-keyed slot which not
-    // every backend exposes consistently.
-    let vps = s.host.list_vault();
+    // Layer 3 — refuse `EventualOnly` providers for snapshot push. The
+    // snapshot pointer is a sole-source coordination record; if the
+    // backend can't promise CAS we'd silently clobber a concurrent
+    // peer's write. We pick from the providers meeting at least
+    // `OptimisticCas`; if none exist we fail loudly with a structured
+    // error rather than degrading.
+    let vps = s
+        .host
+        .vault_providers_at_least(os_types::CasTier::OptimisticCas);
+    if vps.is_empty() && !s.host.list_vault().is_empty() {
+        // Plugins exist but none meets the tier. Surface why.
+        return Err(ApiError::bad(
+            "snapshot push refused: no vault provider declares OptimisticCas or stronger; \
+             EventualOnly backends cannot host the snapshot pointer (Layer 3)",
+        ));
+    }
     let mut verify_failed = false;
     let mut put_handle_hex: Option<String> = None;
     let pushed_to: Option<String> = if let Some(provider_id) = vps.first() {

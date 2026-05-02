@@ -20,6 +20,7 @@ members = [
     "src/vault",
     "src/sync",
     "src/repair",
+    "src/supervisor",
     "src/antientropy",
     "src/plugin_host",
     "src/vfs",
@@ -95,7 +96,9 @@ os-recovery = { path = "src/recovery" }
 os-vault = { path = "src/vault" }
 os-sync = { path = "src/sync" }
 os-repair = { path = "src/repair" }
+os-supervisor = { path = "src/supervisor" }
 os-antientropy = { path = "src/antientropy" }
+tokio-util = { version = "0.7", features = ["io"] }
 os-plugin-host = { path = "src/plugin_host" }
 os-vfs = { path = "src/vfs" }
 os-api = { path = "src/api" }

@@ -40,6 +40,12 @@ os-plugin-host = { path = "../src/plugin_host" }
 os-recovery = { path = "../src/recovery" }
 os-repair = { path = "../src/repair" }
 os-share = { path = "../src/share" }
+os-supervisor = { path = "../src/supervisor" }
+os-entities = { path = "../src/entities" }
+os-placement = { path = "../src/placement" }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 ciborium = { workspace = true }
 os-sync = { path = "../src/sync" }
 os-types = { path = "../src/types" }

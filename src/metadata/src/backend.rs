@@ -4,9 +4,48 @@
 //! lives in `store.rs`.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::{ColumnFamily, MetadataError, Result};
+
+/// Runtime selection of backend implementation. The binary picks one at
+/// startup; tests pick `Memory` for speed.
+#[derive(Debug, Clone)]
+pub enum BackendConfig {
+    /// In-RAM `BTreeMap`. Lost on process exit. Fast tests only.
+    Memory,
+    /// `sled` LSM at the given directory. Survives restart.
+    Sled { path: PathBuf },
+}
+
+impl BackendConfig {
+    /// Open the configured backend.
+    pub fn open(&self) -> Result<Arc<dyn Backend>> {
+        match self {
+            BackendConfig::Memory => Ok(Arc::new(MemoryBackend::new())),
+            BackendConfig::Sled { path } => {
+                std::fs::create_dir_all(path)
+                    .map_err(|e| MetadataError::Backend(format!("mkdir {path:?}: {e}")))?;
+                Ok(Arc::new(SledBackend::open(path)?))
+            }
+        }
+    }
+
+    /// Pick a sensible default from environment. `OPENSTORAGE_MODE=test`
+    /// uses memory; everything else uses sled at
+    /// `<data_dir>/metadata`.
+    pub fn from_env(data_dir: &std::path::Path) -> Self {
+        let mode = std::env::var("OPENSTORAGE_MODE").unwrap_or_default();
+        if mode == "test" {
+            BackendConfig::Memory
+        } else {
+            BackendConfig::Sled {
+                path: data_dir.join("metadata"),
+            }
+        }
+    }
+}
 
 /// One pending write within a transaction.
 #[derive(Debug, Clone)]

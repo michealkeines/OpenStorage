@@ -53,6 +53,43 @@ impl CapabilitySet {
     }
 }
 
+/// What guarantee a backend offers for compare-and-swap on a named blob.
+/// Drives Layer 3 of `STRUCTURAL_REWORK.md`: lease, snapshot-pointer, and
+/// coordination records pick the strongest tier available; weak-CAS
+/// backends are *refused* the metadata-vault role rather than allowed to
+/// silently clobber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CasTier {
+    /// Real If-Match etag CAS — Drive, S3, Azure, GCS, local FS with
+    /// rename-into-place. Safe for sole-source coordination.
+    #[serde(rename = "strong")]
+    StrongCas,
+    /// Read-modify-write with content-hash fence — caller verifies the
+    /// blob hash matches the one captured at read time. Safer than
+    /// EventualOnly but still racy under contention; coordination
+    /// records use it only when ≥3 such backends form a quorum.
+    #[serde(rename = "optimistic")]
+    OptimisticCas,
+    /// No CAS at all — Discord, Catbox, Telegraph, Telegram. The
+    /// engine refuses to host coordination records here. Chunk-role is
+    /// fine: chunks are content-addressed and their handles are not
+    /// rewritten in place.
+    #[serde(rename = "eventual_only")]
+    EventualOnly,
+}
+
+impl CasTier {
+    /// Strict ordering: `StrongCas > OptimisticCas > EventualOnly`.
+    pub fn is_at_least(&self, other: CasTier) -> bool {
+        let rank = |t: CasTier| match t {
+            CasTier::StrongCas => 2,
+            CasTier::OptimisticCas => 1,
+            CasTier::EventualOnly => 0,
+        };
+        rank(*self) >= rank(other)
+    }
+}
+
 /// Returned by `put` when `replaces_handle` was supplied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PriorHandleState {

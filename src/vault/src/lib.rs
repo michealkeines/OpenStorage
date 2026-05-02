@@ -58,12 +58,23 @@ struct VaultManagerInner {
 
 impl VaultManager {
     pub fn new(store: Arc<Store>, plugin_host: Arc<Host>) -> Self {
+        // Layer 0 — rehydrate from the persisted store. If a Vault record
+        // exists, the engine boots into `Locked` (we have metadata but no
+        // master key yet; the user must `unlock`). If multiple vaults exist
+        // the first by id wins — single-vault-per-engine is the design.
+        let (vault_id, state) = match store.iter_vaults() {
+            Ok(vs) if !vs.is_empty() => {
+                let v = vs.into_iter().next().expect("non-empty");
+                (Some(v.vault_id), VaultState::Locked)
+            }
+            _ => (None, VaultState::Uncreated),
+        };
         Self {
             store,
             plugin_host,
             inner: RwLock::new(VaultManagerInner {
-                vault_id: None,
-                state: VaultState::Uncreated,
+                vault_id,
+                state,
                 mk: None,
                 binding: None,
             }),
@@ -87,8 +98,17 @@ impl VaultManager {
     }
 
     pub fn current_pool(&self) -> Result<PoolSnapshot, VaultError> {
+        // Layer 2 — placement must NOT pick providers that the engine
+        // has Quarantined or Banned. We filter the persisted Provider
+        // list against the host's `HealthMonitor` before handing to
+        // placement, so a Discord-shaped account ban (auth failures)
+        // immediately drains traffic to the surviving providers.
         let providers: Vec<Provider> = self.store.iter_providers()?;
-        Ok(PoolSnapshot::from_providers(&providers))
+        let filtered: Vec<Provider> = providers
+            .into_iter()
+            .filter(|p| self.plugin_host.provider_health(p.provider_id).is_active())
+            .collect();
+        Ok(PoolSnapshot::from_providers(&filtered))
     }
 
     pub fn list_chunk_providers(&self) -> Vec<ProviderId> {

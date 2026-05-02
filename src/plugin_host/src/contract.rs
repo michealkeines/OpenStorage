@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use os_entities::{NativeHandle, PutHint};
 use os_types::{
-    AeadTag, BlakeHash, CachedElsewhereRisk, DeleteOutcome, HealthScore, LatencyProfile,
+    AeadTag, BlakeHash, CachedElsewhereRisk, CasTier, DeleteOutcome, HealthScore, LatencyProfile,
     PriorHandleState, QuotaReclaimed, QuotaState, Range, RateLimitState, Timestamp,
 };
 
@@ -105,6 +105,16 @@ pub trait VaultPluginContract: PluginContract {
     /// CAS-backed lease (F-MD-4) and similar small-blob coordination
     /// records.
     async fn named_get(&self, name: &str) -> Result<Option<(Vec<u8>, BlakeHash)>>;
+
+    /// What CAS guarantee this backend offers for `cas_write`. Layer 3 of
+    /// `STRUCTURAL_REWORK.md`: the engine refuses to host
+    /// snapshot-pointer / lease / WAL records on `EventualOnly` backends.
+    /// Default = `OptimisticCas` so existing plugins keep working but
+    /// don't get auto-promoted to sole-source coordination duty until
+    /// they explicitly declare `StrongCas`.
+    fn cas_tier(&self) -> CasTier {
+        CasTier::OptimisticCas
+    }
 }
 
 #[derive(Debug, Clone)]

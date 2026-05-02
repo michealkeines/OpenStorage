@@ -81,9 +81,51 @@ async fn spawn_engine_inner(
         );
         // Register as both chunk and vault role: F-MD-* needs vault-role
         // (cas_write/named_get) and the rest of the harness still expects
-        // chunk-role for writes through the file API.
-        host.register_chunk(*pid, plugin.clone());
+        // chunk-role for writes through the file API. Use *_unpaced so
+        // tests don't sit behind the rate-limit middleware.
+        host.register_chunk_unpaced(*pid, plugin.clone());
         host.register_vault(*pid, plugin);
+
+        // Layer 5 — persist a Provider record so placement can pick
+        // this provider for chunked writes. Without this the chunk
+        // path returns "no providers with required capabilities".
+        use os_entities::Provider;
+        use os_types::{
+            Capability, CapabilitySet, CredentialsHandle, HealthScore, LatencyProfile,
+            LegalClass, PluginId, QuotaState, RateLimitState, Timestamp,
+            TrustCorrelationGroup,
+        };
+        let caps = CapabilitySet::default()
+            .with(Capability::Put)
+            .with(Capability::Get)
+            .with(Capability::Peek)
+            .with(Capability::Delete);
+        let mut txn = os_metadata::Txn::new();
+        let _ = store.put_provider(
+            &mut txn,
+            &Provider {
+                provider_id: *pid,
+                plugin_id: PluginId::new("org.openstorage.local-dir"),
+                instance_label: "test".into(),
+                credentials_handle: CredentialsHandle::new(vec![]).expect("creds"),
+                capabilities: caps,
+                legal_class: LegalClass::Green,
+                trust_correlation_group: TrustCorrelationGroup::new("local"),
+                quota: QuotaState {
+                    total: None,
+                    used: None,
+                    untrusted: false,
+                },
+                rate_limit: RateLimitState {
+                    remaining: u32::MAX,
+                    reset_at: Timestamp::from_string("now"),
+                },
+                health: HealthScore::new(1.0),
+                latency: LatencyProfile::default(),
+                untrusted_quota: false,
+            },
+        );
+        let _ = store.commit(txn);
     }
     let identity = Arc::new(IdentityService::new(store.clone()));
     let vault = Arc::new(VaultManager::new(store.clone(), host.clone()));
@@ -102,7 +144,18 @@ async fn spawn_engine_inner(
         identity.clone(),
         vault.clone(),
     ));
-    let vfs = Arc::new(VfsService::new(store.clone(), vault.clone(), sync));
+    // Layer 5 — bind VFS to the engine's Host so chunked writes route
+    // through the registered plugin. Previously `VfsService::new`
+    // constructed a fresh empty Host, so chunked tests in
+    // shared-provider mode silently failed.
+    let vfs = Arc::new(os_vfs::VfsService::with_host(
+        store.clone(),
+        vault.clone(),
+        sync,
+        host.clone(),
+        os_vfs::VfsConfig::default(),
+    ));
+    let _ = VfsService::new; // suppress unused-import lint; left for future
     let lease = Arc::new(LeaseService::new());
     let repair = Arc::new(RepairScheduler::new(1024));
     let events = Arc::new(EventBus::new());

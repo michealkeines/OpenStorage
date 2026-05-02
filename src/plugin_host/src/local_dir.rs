@@ -181,6 +181,10 @@ impl PluginContract for LocalDirPlugin {
 
 #[async_trait]
 impl VaultPluginContract for LocalDirPlugin {
+    fn cas_tier(&self) -> os_types::CasTier {
+        // Local FS with rename-into-place: real CAS via etag check.
+        os_types::CasTier::StrongCas
+    }
     async fn list(
         &self,
         prefix: &str,

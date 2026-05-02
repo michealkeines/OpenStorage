@@ -193,6 +193,12 @@ pub enum ShadowReason {
     ConcurrentUpdateDemoted,
     #[serde(rename = "plugin_idempotency_violation")]
     PluginIdempotencyViolation,
+    /// Layer 2 of `STRUCTURAL_REWORK.md` — provider was Banned by the
+    /// engine's `HealthMonitor`. Distinct from `RepairReplaced` because
+    /// the bytes may still exist on the banned backend; we just can't
+    /// reach them, and quota counting is uncertain.
+    #[serde(rename = "plugin_banned")]
+    PluginBanned,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

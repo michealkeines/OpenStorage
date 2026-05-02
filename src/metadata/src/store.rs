@@ -67,6 +67,27 @@ impl Store {
     pub fn get_vault(&self, id: VaultId) -> Result<Option<Vault>> {
         self.get_typed(ColumnFamily::VaultMeta, id.as_uuid().as_bytes())
     }
+    /// Enumerate every persisted Vault. Used on boot by `VaultManager` to
+    /// rehydrate state across a restart (Layer 0 of STRUCTURAL_REWORK.md).
+    ///
+    /// Vault entities live under raw 16-byte UUID keys; the same column
+    /// family also holds prefixed records (e.g. `manifest:<UUID>`) for the
+    /// recovery manifest and KDF params, so we filter to exactly 16-byte
+    /// keys here. Bytes that fail to decode as `Vault` are skipped (the
+    /// CF intentionally hosts heterogeneous records).
+    pub fn iter_vaults(&self) -> Result<Vec<Vault>> {
+        let mut out = Vec::new();
+        for kv in self.backend.scan_prefix(ColumnFamily::VaultMeta, b"")? {
+            let (k, v) = kv?;
+            if k.len() != 16 {
+                continue;
+            }
+            if let Ok(vault) = ciborium::from_reader::<Vault, _>(&v[..]) {
+                out.push(vault);
+            }
+        }
+        Ok(out)
+    }
 
     // ─── File ──────────────────────────────────────────────────────────────
     pub fn put_file(&self, txn: &mut Txn, f: &File) -> Result<()> {

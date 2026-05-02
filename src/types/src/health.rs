@@ -97,6 +97,80 @@ pub struct LatencyProfile {
     pub p99_ms: u32,
 }
 
+/// Engine-side classification of a plugin error. Distinct from the plugin's
+/// self-reported `HealthState` (which is in `os-plugin-host`). The engine
+/// maintains *its* view of every provider based on observed errors over a
+/// sliding window — this enum is the input to that classifier.
+///
+/// Layer 2 of `STRUCTURAL_REWORK.md` introduces this so a Discord ban
+/// (auth failures across many objects) is distinguishable from a
+/// transient network blip and from a one-off rate-limit hiccup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ErrorClass {
+    /// 401/403, account banned, token revoked. Repeated → quarantine fast.
+    #[serde(rename = "auth")]
+    Auth,
+    /// 429 with Retry-After. Backs off; should clear.
+    #[serde(rename = "rate_limit")]
+    RateLimit,
+    /// Connection reset, timeout, DNS. Transient infra.
+    #[serde(rename = "network")]
+    Network,
+    /// 404 — handle isn't there. Catalogued separately because read-repair
+    /// reacts to it differently from auth/network.
+    #[serde(rename = "not_found")]
+    NotFound,
+    /// AEAD verify fail / hash mismatch — backend silently lost or
+    /// tampered with the bytes. Drives F-HM-2 read-repair.
+    #[serde(rename = "corruption")]
+    Corruption,
+    /// Anything else; doesn't move the classifier on its own.
+    #[serde(rename = "other")]
+    Other,
+}
+
+/// Engine-maintained provider lifecycle, distinct from the plugin's
+/// self-reported `HealthState`. Placement consults this; repair reacts
+/// when a transition lands.
+///
+/// State machine:
+///
+/// ```text
+///                        ┌── 5+ Auth in 60s ──┐
+///   Active ──── error ──►│                    │
+///      ▲                 ▼                    │
+///      │           Quarantined ──── 5+ min idle ──► Active
+///      │                 │
+///      │          long-quarantined or repeated bans
+///      │                 │
+///      │                 ▼
+///      └──── (manual clear) ──── Banned
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderHealth {
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "quarantined")]
+    Quarantined { reason: ErrorClass, since: Timestamp },
+    #[serde(rename = "banned")]
+    Banned { since: Timestamp },
+}
+
+impl ProviderHealth {
+    pub fn is_active(&self) -> bool {
+        matches!(self, ProviderHealth::Active)
+    }
+    pub fn is_banned(&self) -> bool {
+        matches!(self, ProviderHealth::Banned { .. })
+    }
+}
+
+impl Default for ProviderHealth {
+    fn default() -> Self {
+        ProviderHealth::Active
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tier {
     #[serde(rename = "hot")]

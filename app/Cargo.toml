@@ -39,6 +39,8 @@ ciborium = { workspace = true }
 serde_json = { workspace = true }
 os-lease = { workspace = true }
 os-repair = { workspace = true }
+os-supervisor = { workspace = true }
+tokio-util = { workspace = true }
 os-events = { workspace = true }
 os-entities = { workspace = true }
 os-share = { workspace = true }

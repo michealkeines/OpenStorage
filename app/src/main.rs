@@ -16,7 +16,7 @@ use os_api::{router, AppState};
 use os_crypto::generate_keypair;
 use os_entities::Provider;
 use os_identity::IdentityService;
-use os_metadata::backend::MemoryBackend;
+use os_metadata::backend::BackendConfig;
 use os_metadata::{ColumnFamily, Store, Txn};
 use os_plugin_host::Host;
 use os_plugin_http_backend::HttpBackendPlugin;
@@ -51,7 +51,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let testbench_url = std::env::var("TESTBENCH_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9090".into());
 
-    let store = Arc::new(Store::new(Arc::new(MemoryBackend::new())));
+    // Backend selection: default = sled at <data_dir>/metadata; tests can
+    // pass OPENSTORAGE_MODE=test for in-memory. This is the structural fix
+    // for Layer 0 of STRUCTURAL_REWORK.md — the binary now persists state.
+    let backend_cfg = BackendConfig::from_env(&data_dir);
+    tracing::info!(?backend_cfg, "metadata backend selected");
+    let backend = backend_cfg
+        .open()
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e.to_string())) })?;
+    let store = Arc::new(Store::new(backend));
     let host = Arc::new(Host::new());
 
     // Runtime mode gate. Default = "prod": only production plugins
@@ -247,17 +255,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::collections::HashMap::new(),
     ));
 
-    // Repair worker: drains the scheduler. Currently handles GcSweep tasks
-    // by deleting shards through their plugins and removing chunk/shard
-    // records when fully reclaimed. Read-repair / scrub re-placement is
-    // queued but no-ops past task acknowledgement until the placement loop
-    // is wired (no parity replicas to recover from on EC(1,1) anyway).
+    // Layer 1 — Supervisor wires every autonomous tick loop. Replaces the
+    // ad-hoc tokio::spawn loops that used to live here. See
+    // STRUCTURAL_REWORK.md.
+    let supervisor_cancel = tokio_util::sync::CancellationToken::new();
+    {
+        use std::time::Duration;
+        // Scrubber: sample-based detection of missing/bit-rotted shards.
+        let scrubber = Arc::new(os_supervisor::Scrubber::new(
+            store.clone(),
+            host.clone(),
+            repair.clone(),
+            events.clone(),
+            std::env::var("OPENSTORAGE_SCRUB_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(60)),
+        ));
+        // Layer 2 — HealthEnforcer reacts to Banned providers.
+        let enforcer = Arc::new(os_supervisor::HealthEnforcer::new(
+            store.clone(),
+            host.clone(),
+            repair.clone(),
+            events.clone(),
+            std::env::var("OPENSTORAGE_HEALTH_ENFORCE_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(10)),
+        ));
+        let sup = os_supervisor::Supervisor::new(supervisor_cancel.clone())
+            .with_worker(scrubber)
+            .with_worker(enforcer);
+        tokio::spawn(async move {
+            let mut set = sup.run();
+            while set.join_next().await.is_some() {}
+        });
+    }
+
+    // Repair drainer: still ad-hoc until Layer 2 turns it into a proper
+    // worker. Drains the scheduler, runs GC sweeps, acknowledges other
+    // task kinds.
     {
         let repair_w = repair.clone();
         let store_w = store.clone();
         let host_w = host.clone();
+        let cancel = supervisor_cancel.clone();
         tokio::spawn(async move {
             loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
                 let task = match repair_w.drain_one() {
                     Some(t) => t,
                     None => {
@@ -278,9 +327,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     _ => {
-                        // Other sources (Scrub / ReadRepair / AntiEntropy /
-                        // Rebalance): not yet implemented. Acknowledge and
-                        // move on so the queue drains.
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                 }
@@ -289,15 +335,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Shadow sweep: periodically peek each registered shadow. If the upstream
-    // backend reports `not_found`, the shadow is Cleared (removed). If it
-    // persistently exists despite delete attempts, mark it Permanent.
+    // Shadow sweep: still ad-hoc until Layer 2 promotes it.
     {
         let store_w = store.clone();
         let host_w = host.clone();
+        let cancel = supervisor_cancel.clone();
         tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(2);
             loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
                 if let Err(e) = run_shadow_sweep(&store_w, &host_w).await {
                     tracing::warn!(error = %e, "shadow sweep failed");
                 }

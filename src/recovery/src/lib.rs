@@ -47,6 +47,11 @@ pub enum RecoveryError {
     Unauthenticated,
     #[error("missing recovery mode: {0}")]
     MissingMode(&'static str),
+    /// Layer 4 / §6.A.4 — recovery token has been rotated out of the
+    /// manifest's active set. The provided material was valid at some
+    /// point but is now revoked.
+    #[error("recovery token revoked")]
+    TokenRevoked,
 }
 
 impl From<os_crypto::CryptoError> for RecoveryError {
@@ -224,6 +229,23 @@ impl RecoveryService {
         )
         .map_err(|_| RecoveryError::Unauthenticated)?;
 
+        // Layer 4 / §6.A.4 — recovery token active-set check. A
+        // generated recovery file or Shamir share embeds a
+        // `recovery_token_id`. Rotation OrSetRemoves the old IDs and
+        // OrSetAdds new ones. A revoked token must not unlock — even
+        // if the AEAD check above passes (because the MK is still
+        // mathematically the same; only the token-ID metadata changed
+        // around it). Without this check, "rotate to invalidate a
+        // leaked recovery file" is a paperwork operation.
+        let active: std::collections::BTreeSet<_> = manifest
+            .recovery_token_active_set
+            .live_values()
+            .copied()
+            .collect();
+        if !active.contains(&wmk.recovery_token_id) {
+            return Err(RecoveryError::TokenRevoked);
+        }
+
         IdentityService::verify_chain(&manifest.identity_chain, manifest.identity_anchor_fingerprint)
             .map_err(|e| RecoveryError::Identity(e.to_string()))?;
 
@@ -337,6 +359,16 @@ impl RecoveryService {
         manifest
             .recovery_token_active_set
             .add(new_token.as_uuid().as_u128(), new_token);
+        // Layer 4 / §6.A.4 — keep every wrapped-master-key entry's
+        // `recovery_token_id` consistent with the active set, otherwise
+        // the unlock-side active-set check would reject the manifest's
+        // own primary entry as "revoked". Invalidation here means
+        // *external* recovery files / Shamir shares carrying any of the
+        // old token ids no longer unlock; the in-vault wmk gets the
+        // new id stamped on it.
+        for wmk in manifest.wrapped_master_keys.iter_mut() {
+            wmk.recovery_token_id = new_token;
+        }
         manifest.version_counter = MonotonicCounter(manifest.version_counter.0 + 1);
         let mut txn = Txn::new();
         txn.put(

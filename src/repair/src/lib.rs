@@ -38,6 +38,12 @@ pub enum RepairSource {
     AntiEntropy,
     GcSweep,
     Rebalance,
+    /// Layer 2 — a provider was Banned by `HealthMonitor`. The repair
+    /// drainer evicts every shard that lived on the banned provider:
+    /// register a `Shadow`, mark the chunk Degraded, and (if any other
+    /// healthy provider exists in the pool) re-place to bring
+    /// replication back to target.
+    PluginBan,
 }
 
 #[derive(Debug, Clone)]
