@@ -54,60 +54,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(Store::new(Arc::new(MemoryBackend::new())));
     let host = Arc::new(Host::new());
 
-    // Pick the chunk backend. Defaults to the local testbench; flip to
-    // `OPENSTORAGE_BACKEND=zeroxst` to send ciphertext to the public 0x0.st
-    // anonymous file host. Fault-injection wraps both so the API can drive
-    // Healthy / Degraded transitions either way.
+    // Runtime mode gate. Default = "prod": only production plugins
+    // register. Set OPENSTORAGE_MODE=dev to opt into the local testbench
+    // auto-backend and the dev-only plugin kinds.
+    let mode = std::env::var("OPENSTORAGE_MODE")
+        .unwrap_or_else(|_| "prod".into())
+        .to_lowercase();
+    let is_dev = mode == "dev" || mode == "development" || mode == "test";
+    if is_dev {
+        tracing::warn!(mode = %mode, "openstorage in DEV mode: dev-only plugins permitted");
+    } else {
+        tracing::info!(mode = %mode, "openstorage in PROD mode: only production plugins will register");
+    }
+
+    // Pick the chunk backend (DEV ONLY). Defaults to the local testbench;
+    // flip to `OPENSTORAGE_BACKEND=zeroxst` to use uguu.se. In prod mode
+    // the engine refuses to auto-register a default backend; operators
+    // must populate providers.json (run `os auth add ...`).
     let backend_kind = std::env::var("OPENSTORAGE_BACKEND")
-        .unwrap_or_else(|_| "testbench".into());
-    let provider_id = ProviderId::new_v7();
-    let (inner_plugin, plugin_id_str, trust_group, label, backend_label):
-        (Arc<dyn PluginContract>, &'static str, &'static str, &'static str, String) =
-        match backend_kind.as_str() {
-            "zeroxst" => (
-                Arc::new(ZeroxStPlugin::new()),
-                "org.openstorage.zeroxst",
-                "uguu.se",
-                "uguu.se-public",
-                "https://uguu.se (public, anonymous)".to_string(),
-            ),
-            "telegram" => {
-                let p = TelegramPlugin::from_env()
-                    .expect("TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID required for backend=telegram");
-                (
-                    Arc::new(p),
-                    "org.openstorage.telegram",
-                    "telegram",
-                    "telegram-bot",
-                    "https://api.telegram.org (Bot API)".to_string(),
-                )
-            }
-            "discord" => {
-                let p = DiscordPlugin::from_env()
-                    .expect("DISCORD_WEBHOOK_URL required for backend=discord");
-                (
-                    Arc::new(p),
-                    "org.openstorage.discord",
-                    "discord",
-                    "discord-webhook",
-                    "https://discord.com (webhook)".to_string(),
-                )
-            }
-            _ => (
-                Arc::new(HttpBackendPlugin::new(testbench_url.clone())),
-                "org.openstorage.http_backend",
-                "testbench",
-                "testbench",
-                testbench_url.clone(),
-            ),
-        };
-    let fault_plugin = Arc::new(FaultInjectPlugin::new(inner_plugin));
-    let fault_handle = fault_plugin.handle();
-    // Host reads `plugin.rate_limit_profile()` and wires the middleware
-    // automatically. No per-backend `RateLimitConfig` switch — the plugin
-    // is the source of truth for its own backend's limits.
-    host.register_chunk(provider_id, fault_plugin);
-    persist_provider(&store, provider_id, plugin_id_str, label, trust_group)?;
+        .unwrap_or_else(|_| if is_dev { "testbench".into() } else { "none".into() });
+    // Optional auto-registered default backend. In prod this is bypassed
+    // entirely (backend_kind == "none"); operators populate providers.json.
+    let (fault_handle_opt, backend_label): (
+        Option<os_plugin_fault_inject::FaultHandle>,
+        String,
+    ) = if backend_kind == "none" {
+        (None, "(none — providers.json is the source)".into())
+    } else {
+        // The match below produces an inner plugin per OPENSTORAGE_BACKEND
+        // selection. Fault-injection wraps it so dev tests can drive
+        // Healthy/Degraded transitions. **Dev only**: in prod the testbench
+        // and fault wrapper are not registered.
+        let provider_id = ProviderId::new_v7();
+        let (inner_plugin, plugin_id_str, trust_group, label, backend_label):
+            (Arc<dyn PluginContract>, &'static str, &'static str, &'static str, String) =
+            match backend_kind.as_str() {
+                "zeroxst" => (
+                    Arc::new(ZeroxStPlugin::new()),
+                    "org.openstorage.zeroxst",
+                    "uguu.se",
+                    "uguu.se-public",
+                    "https://uguu.se (public, anonymous)".to_string(),
+                ),
+                "telegram" => {
+                    let p = TelegramPlugin::from_env()
+                        .expect("TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID required for backend=telegram");
+                    (
+                        Arc::new(p),
+                        "org.openstorage.telegram",
+                        "telegram",
+                        "telegram-bot",
+                        "https://api.telegram.org (Bot API)".to_string(),
+                    )
+                }
+                "discord" => {
+                    let p = DiscordPlugin::from_env()
+                        .expect("DISCORD_WEBHOOK_URL required for backend=discord");
+                    (
+                        Arc::new(p),
+                        "org.openstorage.discord",
+                        "discord",
+                        "discord-webhook",
+                        "https://discord.com (webhook)".to_string(),
+                    )
+                }
+                _ => {
+                    if !is_dev {
+                        // Defensive: prod mode should never have hit the
+                        // testbench path; backend_kind is "none" by default.
+                        // If an operator forced OPENSTORAGE_BACKEND=testbench
+                        // while in prod mode, refuse rather than silently
+                        // start a dev-only plugin.
+                        eprintln!(
+                            "REFUSED: OPENSTORAGE_BACKEND={backend_kind} requires OPENSTORAGE_MODE=dev"
+                        );
+                        std::process::exit(2);
+                    }
+                    (
+                        Arc::new(HttpBackendPlugin::new(testbench_url.clone())),
+                        "org.openstorage.http_backend",
+                        "testbench",
+                        "testbench",
+                        testbench_url.clone(),
+                    )
+                }
+            };
+        let fault_plugin = Arc::new(FaultInjectPlugin::new(inner_plugin));
+        let fh = fault_plugin.handle();
+        host.register_chunk(provider_id, fault_plugin);
+        persist_provider(&store, provider_id, plugin_id_str, label, trust_group)?;
+        (Some(fh), backend_label)
+    };
 
     // Multi-instance providers: every entry in the JSON file at the
     // canonical secrets path (or $OPENSTORAGE_PROVIDERS override) becomes
@@ -119,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(default_providers_path);
     if let Some(path) = providers_path {
         if std::path::Path::new(&path).exists() {
-            if let Err(e) = load_providers_file(&path, &host, &store).await {
+            if let Err(e) = load_providers_file(&path, &host, &store, is_dev).await {
                 tracing::warn!(error = %e, file = %path, "providers file load failed");
             }
         } else {
@@ -159,12 +196,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         identity.clone(),
         vault.clone(),
     ));
+    // Redundancy targets — operators tune these per their pool.
+    //
+    //   OPENSTORAGE_REPLICATION_K   default 1
+    //   OPENSTORAGE_REPLICATION_N   default 13 (cap; actual N is bounded by
+    //                               distinct trust groups in the pool)
+    //
+    // With k=1 and a small pool, each chunk is replicated to every distinct
+    // trust group. With k=4 and ≥5 trust groups, chunks are parity-coded
+    // (4-of-N) per the design spec (DESIGN row 122). The actual scheme is
+    // chosen at every chunk write by `os_placement::select_ec_scheme` and
+    // recorded on the Chunk record; mixed schemes coexist (RESILIENCE §3.2).
+    let k_target: u8 = std::env::var("OPENSTORAGE_REPLICATION_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let n_max: u8 = std::env::var("OPENSTORAGE_REPLICATION_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(13)
+        .max(1);
+    let read_hedge: u8 = std::env::var("OPENSTORAGE_READ_HEDGE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let mut vfs_cfg = os_vfs::VfsConfig::default();
+    vfs_cfg.ec_targets = os_placement::EcTargets { k_target, n_max };
+    vfs_cfg.read_hedge = read_hedge;
+    tracing::info!(
+        k_target, n_max, read_hedge,
+        "redundancy targets configured"
+    );
     let vfs = Arc::new(VfsService::with_host(
         store.clone(),
         vault.clone(),
         sync,
         host.clone(),
-        os_vfs::VfsConfig::default(),
+        vfs_cfg,
     ));
     let lease = Arc::new(os_lease::LeaseService::new());
     let repair = Arc::new(os_repair::RepairScheduler::new(4096));
@@ -229,8 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let fh = fault_handle.clone();
-    let fault_any = os_api::FaultHandleAny {
+    let fault_any = fault_handle_opt.map(|fh| os_api::FaultHandleAny {
         fail_puts: Arc::new({
             let fh = fh.clone();
             move |n| fh.fail_next_puts(n)
@@ -269,7 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             }
         }),
-    };
+    });
 
     let app = router(AppState {
         recovery,
@@ -281,7 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         events,
         host,
         device_id,
-        fault: Some(fault_any),
+        fault: fault_any,
         plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
@@ -338,16 +406,43 @@ fn default_providers_path() -> Option<String> {
 /// provider. Each entry is `{ "kind": "...", "label": "...", "..." }`.
 /// Supported kinds: `telegraph`, `uguu`, `gofile`, `catbox`, `discord`,
 /// `telegram`. New kinds get added here as plugins land.
+/// Plugin kinds classified as **production**. Anything else is dev-only
+/// and rejected from `providers.json` when `OPENSTORAGE_MODE=prod`.
+fn is_production_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "uguu"
+            | "catbox"
+            | "paste_rs"
+            | "filebin"
+            | "telegraph"
+            | "telegram"
+            | "discord"
+            | "github"
+    )
+}
+
 async fn load_providers_file(
     path: &str,
     host: &Arc<Host>,
     store: &Arc<Store>,
+    is_dev: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bytes = std::fs::read(path)?;
     let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
     let mut counts: std::collections::HashMap<String, usize> = Default::default();
+    let mut refused = 0u32;
     for entry in &entries {
         let kind = entry["kind"].as_str().unwrap_or("?").to_string();
+        if !is_dev && !is_production_kind(&kind) {
+            tracing::warn!(
+                kind = %kind,
+                label = entry["label"].as_str().unwrap_or("?"),
+                "REFUSED in prod mode (dev-only plugin); set OPENSTORAGE_MODE=dev to allow"
+            );
+            refused += 1;
+            continue;
+        }
         let label = entry["label"]
             .as_str()
             .map(str::to_string)
@@ -376,6 +471,15 @@ async fn load_providers_file(
                 Arc::new(plugin)
             }
             "uguu" => Arc::new(os_plugin_zeroxst::ZeroxStPlugin::new()),
+            "catbox" => Arc::new(os_plugin_catbox::CatboxPlugin::new()),
+            "paste_rs" => Arc::new(os_plugin_paste_rs::PasteRsPlugin::new()),
+            "filebin" => {
+                let plugin = match entry["bin"].as_str() {
+                    Some(b) => os_plugin_filebin::FilebinPlugin::with_bin(b.to_string()),
+                    None => os_plugin_filebin::FilebinPlugin::new(),
+                };
+                Arc::new(plugin)
+            }
             "github" => {
                 let owner = match entry["owner"].as_str() {
                     Some(s) => s.to_string(),
@@ -419,6 +523,26 @@ async fn load_providers_file(
                 };
                 Arc::new(os_plugin_discord::DiscordPlugin::new(url))
             }
+            // Dev-only: each entry owns a local directory and gets its own
+            // declared trust_group. Used by redundancy smoke tests to spin
+            // up N distinct trust groups on one host.
+            "local_dir" => {
+                let path = match entry["path"].as_str() {
+                    Some(p) => p.to_string(),
+                    None => {
+                        tracing::warn!(label=%label, "local_dir entry missing 'path'; skipping");
+                        continue;
+                    }
+                };
+                let plugin = match os_plugin_host::LocalDirPlugin::new(&path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(label=%label, ?e, "local_dir init failed; skipping");
+                        continue;
+                    }
+                };
+                Arc::new(plugin)
+            }
             other => {
                 tracing::warn!(kind = %other, "unknown provider kind; skipping");
                 continue;
@@ -426,25 +550,40 @@ async fn load_providers_file(
         };
         host.register_chunk(provider_id, plugin);
         *counts.entry(kind.clone()).or_default() += 1;
-        let trust_group: &'static str = match kind.as_str() {
-            "telegraph" => "telegram-graph",
-            "uguu" => "uguu",
-            "github" => "github",
-            "telegram" => "telegram",
-            "discord" => "discord",
-            _ => "unknown",
-        };
+        // Trust group: explicit per-entry override > kind-default. The
+        // per-entry override is required for local_dir (redundancy tests
+        // configure N distinct local-dir entries each with its own group).
+        let trust_group: String = entry["trust_group"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                match kind.as_str() {
+                    "telegraph" => "telegram-graph",
+                    "uguu" => "uguu",
+                    "github" => "github",
+                    "catbox" => "catbox",
+                    "paste_rs" => "paste-rs",
+                    "filebin" => "filebin",
+                    "telegram" => "telegram",
+                    "discord" => "discord",
+                    "local_dir" => "local-dir",
+                    _ => "unknown",
+                }
+                .to_string()
+            });
         let plugin_id_str: &'static str = match kind.as_str() {
             "telegraph" => "org.openstorage.telegraph",
             "uguu" => "org.openstorage.zeroxst",
             "github" => "org.openstorage.github",
+            "catbox" => "org.openstorage.catbox",
+            "paste_rs" => "org.openstorage.paste_rs",
+            "filebin" => "org.openstorage.filebin",
             "telegram" => "org.openstorage.telegram",
             "discord" => "org.openstorage.discord",
+            "local_dir" => "org.openstorage.local",
             _ => "org.openstorage.unknown",
         };
-        // We can't reuse persist_provider with a borrowed label since it
-        // expects &'static str. Inline a one-off persist.
-        persist_dynamic_provider(store, provider_id, plugin_id_str, &label, trust_group)?;
+        persist_dynamic_provider(store, provider_id, plugin_id_str, &label, &trust_group)?;
         tracing::info!(provider_id = %provider_id, kind = %kind, label = %label, "registered provider");
     }
     let counts_str: String = counts
@@ -452,7 +591,18 @@ async fn load_providers_file(
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(", ");
-    tracing::info!("providers loaded: {} ({counts_str})", entries.len());
+    let registered: usize = counts.values().sum();
+    if refused > 0 {
+        tracing::info!(
+            "providers loaded: {} of {} ({counts_str}); {refused} refused in prod mode",
+            registered, entries.len()
+        );
+    } else {
+        tracing::info!(
+            "providers loaded: {} ({counts_str})",
+            registered
+        );
+    }
     Ok(())
 }
 

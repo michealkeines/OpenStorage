@@ -31,7 +31,7 @@ pub fn encrypt(
                 return Err(CryptoError::Input("ChaCha20-Poly1305 needs 12-byte nonce"));
             }
             let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
-            let mut combined = cipher
+            let combined = cipher
                 .encrypt(
                     nonce_bytes.into(),
                     Payload {
@@ -40,14 +40,14 @@ pub fn encrypt(
                     },
                 )
                 .map_err(|_| CryptoError::AeadVerify)?;
-            split_tag(&mut combined)
+            split_tag(combined)
         }
         AeadSuite::Aes256Gcm => {
             if nonce_bytes.len() != 12 {
                 return Err(CryptoError::Input("AES-256-GCM needs 12-byte nonce"));
             }
             let cipher = Aes256Gcm::new(key.as_bytes().into());
-            let mut combined = cipher
+            let combined = cipher
                 .encrypt(
                     nonce_bytes.into(),
                     aes_gcm::aead::Payload {
@@ -56,7 +56,7 @@ pub fn encrypt(
                     },
                 )
                 .map_err(|_| CryptoError::AeadVerify)?;
-            split_tag(&mut combined)
+            split_tag(combined)
         }
         AeadSuite::XChaCha20Poly1305 => {
             // Reserved; the type system permits it but we don't have an impl yet.
@@ -110,7 +110,9 @@ pub fn decrypt(
     }
 }
 
-fn split_tag(combined: &mut Vec<u8>) -> Result<(Vec<u8>, AeadTag), CryptoError> {
+fn split_tag(mut combined: Vec<u8>) -> Result<(Vec<u8>, AeadTag), CryptoError> {
+    // Take by value and truncate in-place so a multi-MiB ciphertext is not
+    // re-cloned just to detach the trailing tag.
     if combined.len() < 16 {
         return Err(CryptoError::Input("AEAD output shorter than tag"));
     }
@@ -118,7 +120,7 @@ fn split_tag(combined: &mut Vec<u8>) -> Result<(Vec<u8>, AeadTag), CryptoError> 
     let mut tag = [0u8; 16];
     tag.copy_from_slice(&combined[tag_start..]);
     combined.truncate(tag_start);
-    Ok((combined.clone(), AeadTag(tag)))
+    Ok((combined, AeadTag(tag)))
 }
 
 /// Generate a random 12-byte nonce. Use ONLY when the same key is fresh

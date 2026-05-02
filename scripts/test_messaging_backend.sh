@@ -71,7 +71,7 @@ sleep 1
 echo -e "${BLUE}==> starting engine with backend=$BACKEND${END}"
 OPENSTORAGE_BIND="127.0.0.1:$PORT_OS" \
 OPENSTORAGE_DATA_DIR="$WORK_DIR/engine" \
-OPENSTORAGE_BACKEND="$BACKEND" \
+OPENSTORAGE_MODE=dev OPENSTORAGE_BACKEND="$BACKEND" \
     "$ENGINE" >"$WORK_DIR/engine.log" 2>&1 &
 OS_PID=$!
 for i in $(seq 1 40); do

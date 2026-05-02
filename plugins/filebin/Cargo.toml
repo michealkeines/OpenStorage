@@ -1,5 +1,5 @@
 [package]
-name = "os-metadata"
+name = "os-plugin-filebin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,8 @@ license.workspace = true
 [dependencies]
 os-types = { workspace = true }
 os-entities = { workspace = true }
-os-crypto = { workspace = true }
-serde = { workspace = true }
-ciborium = { workspace = true }
-thiserror = { workspace = true }
-sled = { workspace = true }
+os-plugin-host = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

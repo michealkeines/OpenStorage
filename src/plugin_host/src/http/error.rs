@@ -23,7 +23,11 @@ pub fn status_to_plugin_error(
     }
     let body_text = std::str::from_utf8(body).unwrap_or("<binary>").to_string();
     match status {
-        404 => PluginError::Plugin("not found".into()),
+        404 | 410 => PluginError::NotFound(if body_text.is_empty() {
+            "404".into()
+        } else {
+            body_text.clone()
+        }),
         401 | 403 => PluginError::AuthFailure,
         413 | 415 | 422 => PluginError::Plugin(format!("client error {status}: {body_text}")),
         // Other 4xx are not retryable; surface as Plugin.
@@ -57,7 +61,15 @@ mod tests {
     fn _404_is_not_found() {
         assert!(matches!(
             status_to_plugin_error(404, b"", None),
-            PluginError::Plugin(_)
+            PluginError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn _410_is_not_found() {
+        assert!(matches!(
+            status_to_plugin_error(410, b"", None),
+            PluginError::NotFound(_)
         ));
     }
 

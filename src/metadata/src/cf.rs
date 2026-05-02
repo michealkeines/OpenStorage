@@ -17,6 +17,10 @@ pub enum ColumnFamily {
     WalIndex,
     LargeValues,
     Identity,
+    /// Secondary index: `path bytes → file_id (16 bytes)`.
+    /// Lets `find_by_path` be a single point-lookup and `list(prefix)` a
+    /// scan_prefix instead of decoding every File record.
+    PathIndex,
 }
 
 impl ColumnFamily {
@@ -36,10 +40,11 @@ impl ColumnFamily {
             Self::WalIndex => "wal_index",
             Self::LargeValues => "large_values",
             Self::Identity => "identity",
+            Self::PathIndex => "path_index",
         }
     }
 
-    pub const ALL: [ColumnFamily; 14] = [
+    pub const ALL: [ColumnFamily; 15] = [
         Self::Files,
         Self::Chunks,
         Self::Shards,
@@ -54,5 +59,6 @@ impl ColumnFamily {
         Self::WalIndex,
         Self::LargeValues,
         Self::Identity,
+        Self::PathIndex,
     ];
 }

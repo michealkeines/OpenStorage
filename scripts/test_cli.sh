@@ -64,7 +64,7 @@ ok "testbench up"
 step "starting engine on :$PORT_OS"
 OPENSTORAGE_BIND="127.0.0.1:$PORT_OS" \
 OPENSTORAGE_DATA_DIR="$WORK_DIR/engine" \
-TESTBENCH_URL="http://127.0.0.1:$PORT_TB" \
+OPENSTORAGE_MODE=dev TESTBENCH_URL="http://127.0.0.1:$PORT_TB" \
     "$ENGINE" >"$WORK_DIR/engine.log" 2>&1 &
 OS_PID=$!
 for i in $(seq 1 30); do

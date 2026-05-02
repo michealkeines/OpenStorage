@@ -21,6 +21,7 @@ os-wal = { workspace = true }
 os-sync = { workspace = true }
 os-vault = { workspace = true }
 os-vfs = { workspace = true }
+os-placement = { workspace = true }
 os-identity = { workspace = true }
 os-recovery = { workspace = true }
 os-plugin-host = { workspace = true }
@@ -31,6 +32,9 @@ os-plugin-telegraph = { workspace = true }
 os-plugin-github-repo = { workspace = true }
 os-plugin-telegram = { workspace = true }
 os-plugin-discord = { workspace = true }
+os-plugin-catbox = { workspace = true }
+os-plugin-paste-rs = { workspace = true }
+os-plugin-filebin = { workspace = true }
 ciborium = { workspace = true }
 serde_json = { workspace = true }
 os-lease = { workspace = true }

@@ -33,6 +33,9 @@ members = [
     "plugins/discord",
     "plugins/telegraph",
     "plugins/github_repo",
+    "plugins/catbox",
+    "plugins/paste_rs",
+    "plugins/filebin",
 ]
 
 [workspace.package]
@@ -103,6 +106,9 @@ os-plugin-telegram = { path = "plugins/telegram" }
 os-plugin-discord = { path = "plugins/discord" }
 os-plugin-telegraph = { path = "plugins/telegraph" }
 os-plugin-github-repo = { path = "plugins/github_repo" }
+os-plugin-catbox = { path = "plugins/catbox" }
+os-plugin-paste-rs = { path = "plugins/paste_rs" }
+os-plugin-filebin = { path = "plugins/filebin" }
 
 [profile.dev]
 opt-level = 0

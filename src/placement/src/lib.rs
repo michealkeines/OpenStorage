@@ -75,6 +75,68 @@ impl Default for DiversityPolicy {
     }
 }
 
+/// Caller-supplied targets for dynamic EC selection.
+///
+/// Per RESILIENCE.md §3.2:
+///
+/// ```text
+/// available_groups = distinct trust-correlation groups in healthy plugin pool
+/// N_max            = max practical (capped by config; default 13)
+/// K_target         = config.redundancy.k (default 4)
+/// N_chosen         = min(available_groups, N_max)
+/// if N_chosen < K_target + 1:
+///   fall back to replication mode (replication_factor = available_groups)
+/// else:
+///   EC scheme = (K_target, N_chosen)
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct EcTargets {
+    pub k_target: u8,
+    pub n_max: u8,
+}
+
+impl Default for EcTargets {
+    fn default() -> Self {
+        // Engine default keeps `k_target=1` so deployments with a small
+        // pool transparently get replication. Operators with ≥5 distinct
+        // trust groups should bump `k_target` to 4 (the design's spec
+        // default) for storage-efficient parity coding.
+        Self { k_target: 1, n_max: 13 }
+    }
+}
+
+/// Pick the EC scheme for a *new* chunk write given the live pool. The
+/// chosen scheme is recorded on the Chunk record; mixed schemes coexist.
+///
+/// Returns `(1, 1)` only when the pool has exactly one distinct trust
+/// group — that's an explicit single-copy mode (no redundancy possible).
+/// Otherwise the function picks the most resilient scheme the pool can
+/// sustain.
+pub fn select_ec_scheme(pool: &PoolSnapshot, targets: EcTargets) -> ECScheme {
+    let mut groups: std::collections::BTreeSet<&TrustCorrelationGroup> =
+        std::collections::BTreeSet::new();
+    for p in &pool.providers {
+        groups.insert(&p.trust_group);
+    }
+    let available = groups.len() as u8;
+    if available == 0 {
+        // Caller will bail at placement time anyway; emit something safe.
+        return ECScheme { k: 1, n: 1 };
+    }
+    let n_chosen = available.min(targets.n_max).max(1);
+    let k_target = targets.k_target.max(1);
+    if n_chosen < k_target.saturating_add(1) {
+        // Replication: k=1, n=available. Tolerates n-1 losses.
+        ECScheme { k: 1, n: n_chosen }
+    } else {
+        // Parity-coded EC: (k_target, n_chosen). Tolerates n-k losses.
+        ECScheme {
+            k: k_target,
+            n: n_chosen,
+        }
+    }
+}
+
 /// Choose `(shard_index, ProviderId)` for each shard of a chunk.
 pub fn pick_shards_for_chunk(
     chunk_hash: ChunkHash,
@@ -222,6 +284,66 @@ mod tests {
         let b = pick_shards_for_chunk(h, scheme, &pool, DiversityPolicy::default(), Tier::Hot)
             .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ec_selection_replication_when_pool_small() {
+        // 2 trust groups, default k_target=1: replication(2).
+        let pool = PoolSnapshot {
+            providers: vec![entry("a"), entry("b")],
+        };
+        let s = select_ec_scheme(&pool, EcTargets::default());
+        assert_eq!((s.k, s.n), (1, 2));
+    }
+
+    #[test]
+    fn ec_selection_replication_factor_bounded_by_groups() {
+        // 5 trust groups, k_target=1: replication(5).
+        let pool = PoolSnapshot {
+            providers: vec![entry("a"), entry("b"), entry("c"), entry("d"), entry("e")],
+        };
+        let s = select_ec_scheme(&pool, EcTargets { k_target: 1, n_max: 13 });
+        assert_eq!((s.k, s.n), (1, 5));
+    }
+
+    #[test]
+    fn ec_selection_picks_parity_scheme_when_pool_large() {
+        // k_target=4, 7 distinct groups: (4, 7).
+        let pool = PoolSnapshot {
+            providers: (0..7).map(|i| entry(&format!("g{i}"))).collect(),
+        };
+        let s = select_ec_scheme(&pool, EcTargets { k_target: 4, n_max: 13 });
+        assert_eq!((s.k, s.n), (4, 7));
+    }
+
+    #[test]
+    fn ec_selection_falls_back_when_groups_below_threshold() {
+        // k_target=4, only 4 distinct groups → can't satisfy k+1, fall
+        // back to replication(4).
+        let pool = PoolSnapshot {
+            providers: (0..4).map(|i| entry(&format!("g{i}"))).collect(),
+        };
+        let s = select_ec_scheme(&pool, EcTargets { k_target: 4, n_max: 13 });
+        assert_eq!((s.k, s.n), (1, 4));
+    }
+
+    #[test]
+    fn ec_selection_caps_at_n_max() {
+        // 20 groups but n_max=7: cap.
+        let pool = PoolSnapshot {
+            providers: (0..20).map(|i| entry(&format!("g{i}"))).collect(),
+        };
+        let s = select_ec_scheme(&pool, EcTargets { k_target: 4, n_max: 7 });
+        assert_eq!((s.k, s.n), (4, 7));
+    }
+
+    #[test]
+    fn ec_selection_single_group_means_no_redundancy() {
+        let pool = PoolSnapshot {
+            providers: vec![entry("solo"), entry("solo")],
+        };
+        let s = select_ec_scheme(&pool, EcTargets::default());
+        assert_eq!((s.k, s.n), (1, 1));
     }
 
     #[test]

@@ -219,6 +219,21 @@ enum AuthKind {
         #[arg(long)]
         label: Option<String>,
     },
+    /// catbox.moe — anonymous, persistent, 200 MiB cap.
+    Catbox {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// paste.rs — anonymous text-only paste (binary base64-encoded).
+    PasteRs {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// filebin.net — anonymous bin-based host (5 GiB / bin, 7-day TTL).
+    Filebin {
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1363,7 +1378,10 @@ async fn auth_cmd(client: &reqwest::Client, cmd: AuthCmd) -> Result<()> {
             AuthKind::Telegram { label } => add_telegram(client, label).await?,
             AuthKind::Discord { label } => add_discord(client, label).await?,
             AuthKind::Telegraph { label } => add_telegraph(client, label).await?,
-            AuthKind::Uguu { label } => add_uguu(label)?,
+            AuthKind::Uguu { label } => add_anonymous("uguu", label)?,
+            AuthKind::Catbox { label } => add_anonymous("catbox", label)?,
+            AuthKind::PasteRs { label } => add_anonymous("paste_rs", label)?,
+            AuthKind::Filebin { label } => add_anonymous("filebin", label)?,
         },
     }
     Ok(())
@@ -1524,13 +1542,13 @@ async fn add_telegraph(client: &reqwest::Client, label: Option<String>) -> Resul
     Ok(())
 }
 
-fn add_uguu(label: Option<String>) -> Result<()> {
-    let label = label.unwrap_or_else(|| format!("uguu-{}", chrono_like_label()));
+fn add_anonymous(kind: &str, label: Option<String>) -> Result<()> {
+    let label = label.unwrap_or_else(|| format!("{kind}-{}", chrono_like_label()));
     let mut entries = load_providers()?;
     entries.retain(|e| e["label"].as_str() != Some(&label));
-    entries.push(serde_json::json!({ "kind": "uguu", "label": label }));
+    entries.push(serde_json::json!({ "kind": kind, "label": label }));
     save_providers(&entries)?;
-    println!("✓ added {label}");
+    println!("✓ added {label} (kind={kind}, no credential)");
     Ok(())
 }
 

@@ -44,7 +44,7 @@ N=$(python3 -c "import json,sys;print(len(json.load(open('$PROVIDERS_FILE'))))")
 echo -e "${BLUE}==> starting engine with $N providers from $PROVIDERS_FILE${END}"
 OPENSTORAGE_BIND="127.0.0.1:$PORT_OS" \
 OPENSTORAGE_DATA_DIR="$WORK_DIR/engine" \
-OPENSTORAGE_BACKEND="zeroxst" \
+OPENSTORAGE_MODE=dev OPENSTORAGE_BACKEND="zeroxst" \
 OPENSTORAGE_PROVIDERS="$PROVIDERS_FILE" \
     "$ENGINE" >"$WORK_DIR/engine.log" 2>&1 &
 OS_PID=$!

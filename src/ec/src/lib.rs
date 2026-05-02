@@ -31,6 +31,11 @@ pub fn encode(scheme: ECScheme, payload: &[u8]) -> Result<Vec<Vec<u8>>, EcError>
     }
     if k == n {
         // (1,1) and (k,k): no parity. Produce k data shards directly.
+        if k == 1 {
+            // Single-shard fast path: avoid the unnecessary alloc+memcpy in
+            // split_into_k for the default deployment topology.
+            return Ok(vec![payload.to_vec()]);
+        }
         return Ok(split_into_k(payload, k));
     }
     let r = ReedSolomon::new(k, parity).map_err(|e| EcError::Scheme(e.to_string()))?;
@@ -65,6 +70,17 @@ pub fn reconstruct(
     }
     if k == n {
         // No parity — every data shard is required.
+        if k == 1 {
+            // Single-shard fast path: move the only shard out without a
+            // concatenation buffer copy.
+            let mut s = shards_in
+                .into_iter()
+                .next()
+                .and_then(|x| x)
+                .ok_or(EcError::InsufficientShards { have: 0, need: 1 })?;
+            s.truncate(original_len);
+            return Ok(s);
+        }
         let mut out = Vec::with_capacity(original_len);
         for shard in shards_in.iter_mut().take(k) {
             let s = shard.take().ok_or(EcError::InsufficientShards {
@@ -136,6 +152,20 @@ mod tests {
     fn replication_k1_n3() {
         let s = ECScheme::replication(3);
         round_trip_with_drops(s, b"abc", &[0, 2]);
+    }
+
+    #[test]
+    fn k1_n1_short_circuit_round_trip() {
+        // Default deployment topology: replication=1. Verify the fast path
+        // round-trips byte-for-byte without padding artifacts.
+        let s = ECScheme::new(1, 1).unwrap();
+        let payload: Vec<u8> = (0..1234).map(|i| (i & 0xff) as u8).collect();
+        let shards = encode(s, &payload).unwrap();
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0], payload);
+        let opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        let out = reconstruct(s, opt, payload.len()).unwrap();
+        assert_eq!(out, payload);
     }
 
     #[test]

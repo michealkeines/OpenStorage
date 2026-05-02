@@ -71,6 +71,16 @@ impl Store {
     // ─── File ──────────────────────────────────────────────────────────────
     pub fn put_file(&self, txn: &mut Txn, f: &File) -> Result<()> {
         txn.put(ColumnFamily::Files, f.file_id.as_uuid().as_bytes().as_slice(), self.encode(f)?);
+        // Maintain the path → file_id secondary index. We always write the
+        // current path; stale entries from path renames are an open
+        // limitation of this baseline (see FUTURE_IMPROVEMENTS) but for
+        // create+delete (the only mutators wired today) the mapping is
+        // correct.
+        txn.put(
+            ColumnFamily::PathIndex,
+            f.path.value.as_bytes().to_vec(),
+            f.file_id.as_uuid().as_bytes().to_vec(),
+        );
         Ok(())
     }
     pub fn get_file(&self, id: FileId) -> Result<Option<File>> {
@@ -78,6 +88,48 @@ impl Store {
     }
     pub fn delete_file(&self, txn: &mut Txn, id: FileId) {
         txn.delete(ColumnFamily::Files, id.as_uuid().as_bytes().as_slice());
+    }
+    /// O(log N) point lookup via `PathIndex`. Falls back to a full scan
+    /// only if the index entry is missing (legacy stores written before the
+    /// index existed, or if mid-migration).
+    pub fn get_file_by_path(&self, path: &str) -> Result<Option<File>> {
+        if let Some(id_bytes) = self.backend.get(ColumnFamily::PathIndex, path.as_bytes())? {
+            if let Some(arr) = id_bytes.get(..16) {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(arr);
+                let fid = FileId::from_uuid(uuid::Uuid::from_bytes(a));
+                if let Some(f) = self.get_file(fid)? {
+                    if f.path.value == path {
+                        return Ok(Some(f));
+                    }
+                }
+            }
+        }
+        // Fallback: linear scan (legacy data without index).
+        for f in self.iter_files()? {
+            if f.path.value == path {
+                return Ok(Some(f));
+            }
+        }
+        Ok(None)
+    }
+    /// Files whose stored path begins with `prefix`. Uses the path index to
+    /// avoid decoding every File record.
+    pub fn list_files_with_prefix(&self, prefix: &str) -> Result<Vec<File>> {
+        let mut out = Vec::new();
+        for r in self.backend.scan_prefix(ColumnFamily::PathIndex, prefix.as_bytes())? {
+            let (_k, v) = r?;
+            if v.len() < 16 {
+                continue;
+            }
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&v[..16]);
+            let fid = FileId::from_uuid(uuid::Uuid::from_bytes(a));
+            if let Some(f) = self.get_file(fid)? {
+                out.push(f);
+            }
+        }
+        Ok(out)
     }
     pub fn iter_files(&self) -> Result<Vec<File>> {
         let mut out = Vec::new();
@@ -235,6 +287,69 @@ mod tests {
         store.commit(t).unwrap();
         let got = store.get_file(f.file_id).unwrap().unwrap();
         assert_eq!(got.path.value, "/x");
+    }
+
+    #[test]
+    fn path_index_lookup() {
+        // Verify the secondary index gives O(log N) lookups by path.
+        let store = Store::new(Arc::new(MemoryBackend::new()));
+        let d = dev();
+        let fid = FileId::new_v7();
+        let f = File {
+            file_id: fid,
+            path: LwwRegister::new("/alpha/one.txt".into(), Hlc::new(1, 0), d),
+            size_bytes: LwwRegister::new(0, Hlc::new(1, 0), d),
+            created_at: LwwRegister::new(Timestamp::from_string("now"), Hlc::new(1, 0), d),
+            modified_at: LwwRegister::new(Timestamp::from_string("now"), Hlc::new(1, 0), d),
+            permissions: LwwRegister::new(Permissions::default(), Hlc::new(1, 0), d),
+            content_type: LwwRegister::new(String::new(), Hlc::new(1, 0), d),
+            tier_pinned: LwwRegister::new(None, Hlc::new(1, 0), d),
+            inline_payload: None,
+            chunk_list: None,
+            wrapped_keys: OrSet::new(),
+            acl: OrSet::new(),
+            exists: LwwRegister::new(true, Hlc::new(1, 0), d),
+        };
+        let mut t = Txn::new();
+        store.put_file(&mut t, &f).unwrap();
+        store.commit(t).unwrap();
+        let got = store.get_file_by_path("/alpha/one.txt").unwrap().unwrap();
+        assert_eq!(got.file_id, fid);
+        assert!(store.get_file_by_path("/missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_files_with_prefix_uses_index() {
+        let store = Store::new(Arc::new(MemoryBackend::new()));
+        let d = dev();
+        for p in ["/a/1", "/a/2", "/b/1"] {
+            let mut t = Txn::new();
+            let f = File {
+                file_id: FileId::new_v7(),
+                path: LwwRegister::new(p.into(), Hlc::new(1, 0), d),
+                size_bytes: LwwRegister::new(0, Hlc::new(1, 0), d),
+                created_at: LwwRegister::new(Timestamp::from_string("now"), Hlc::new(1, 0), d),
+                modified_at: LwwRegister::new(Timestamp::from_string("now"), Hlc::new(1, 0), d),
+                permissions: LwwRegister::new(Permissions::default(), Hlc::new(1, 0), d),
+                content_type: LwwRegister::new(String::new(), Hlc::new(1, 0), d),
+                tier_pinned: LwwRegister::new(None, Hlc::new(1, 0), d),
+                inline_payload: None,
+                chunk_list: None,
+                wrapped_keys: OrSet::new(),
+                acl: OrSet::new(),
+                exists: LwwRegister::new(true, Hlc::new(1, 0), d),
+            };
+            store.put_file(&mut t, &f).unwrap();
+            store.commit(t).unwrap();
+        }
+        let mut paths: Vec<String> = store
+            .list_files_with_prefix("/a/")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path.value)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/a/1".to_string(), "/a/2".to_string()]);
     }
 
     #[test]

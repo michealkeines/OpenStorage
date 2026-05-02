@@ -501,12 +501,15 @@ fn jitter(max: Duration) -> Duration {
 #[async_trait]
 impl PluginContract for RateLimitMiddleware {
     async fn put(&self, payload: &[u8], hint: &PutHint) -> PluginResult<PutResult> {
-        let payload_owned = payload.to_vec();
-        let hint_owned = hint.clone();
+        // Wrap the payload in an Arc once so the retry closure shares bytes
+        // by Arc-clone instead of copying multi-MiB chunk plaintext per
+        // attempt. Same idea for the small `hint`.
+        let payload_arc: Arc<[u8]> = Arc::from(payload);
+        let hint_arc = Arc::new(hint.clone());
         self.run(Op::Put, move || {
             let inner = self.inner.clone();
-            let p = payload_owned.clone();
-            let h = hint_owned.clone();
+            let p = payload_arc.clone();
+            let h = hint_arc.clone();
             async move { inner.put(&p, &h).await }
         })
         .await
@@ -517,7 +520,7 @@ impl PluginContract for RateLimitMiddleware {
         handle: &NativeHandle,
         range: Option<Range>,
     ) -> PluginResult<Vec<u8>> {
-        let h = handle.clone();
+        let h = Arc::new(handle.clone());
         let r = range;
         self.run(Op::Get, move || {
             let inner = self.inner.clone();
@@ -528,7 +531,7 @@ impl PluginContract for RateLimitMiddleware {
     }
 
     async fn peek(&self, handle: &NativeHandle) -> PluginResult<PeekResult> {
-        let h = handle.clone();
+        let h = Arc::new(handle.clone());
         self.run(Op::Peek, move || {
             let inner = self.inner.clone();
             let hh = h.clone();
@@ -538,7 +541,7 @@ impl PluginContract for RateLimitMiddleware {
     }
 
     async fn delete(&self, handle: &NativeHandle) -> PluginResult<DeleteResult> {
-        let h = handle.clone();
+        let h = Arc::new(handle.clone());
         self.run(Op::Delete, move || {
             let inner = self.inner.clone();
             let hh = h.clone();
@@ -605,6 +608,84 @@ mod tests {
         async fn health(&self) -> PluginResult<HealthReport> {
             unimplemented!()
         }
+    }
+
+    /// Inner plugin that records the address of the slice it received.
+    /// Used to verify the rate-limit middleware does not allocate a fresh
+    /// payload buffer per retry attempt — when wrapped in `Arc<[u8]>`, the
+    /// pointer the inner plugin sees is stable across retries.
+    struct RecordPtrPlugin {
+        seen_ptrs: tokio::sync::Mutex<Vec<usize>>,
+        fail_first: u32,
+        seen: AtomicU32,
+    }
+
+    #[async_trait]
+    impl PluginContract for RecordPtrPlugin {
+        async fn put(
+            &self,
+            payload: &[u8],
+            _hint: &PutHint,
+        ) -> PluginResult<PutResult> {
+            self.seen_ptrs.lock().await.push(payload.as_ptr() as usize);
+            let n = self.seen.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_first {
+                return Err(PluginError::RateLimited {
+                    retry_after: Duration::from_millis(10),
+                    scope: RateLimitScope::Global,
+                });
+            }
+            Ok(PutResult {
+                handle: NativeHandle(b"h".to_vec()),
+                handle_changed: true,
+                prior_handle_state: None,
+                stored_at: os_types::Timestamp::from_string("test"),
+                quota_reclaimed: os_types::QuotaReclaimed::Unknown,
+                tombstone_clears_at: None,
+            })
+        }
+        async fn get(
+            &self,
+            _h: &NativeHandle,
+            _r: Option<Range>,
+        ) -> PluginResult<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn peek(&self, _h: &NativeHandle) -> PluginResult<PeekResult> {
+            unimplemented!()
+        }
+        async fn delete(&self, _h: &NativeHandle) -> PluginResult<DeleteResult> {
+            unimplemented!()
+        }
+        async fn health(&self) -> PluginResult<HealthReport> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_share_payload_arc_no_clone() {
+        // Arc<[u8]> sharing means the same backing buffer is seen across
+        // every retry attempt. Without it, every retry would carry a fresh
+        // Vec<u8> (multi-MiB copies for chunked uploads).
+        let inner = Arc::new(RecordPtrPlugin {
+            seen_ptrs: tokio::sync::Mutex::new(Vec::new()),
+            fail_first: 3,
+            seen: AtomicU32::new(0),
+        });
+        let mut cfg = RateLimitConfig::unbounded();
+        cfg.jitter = Duration::from_millis(0);
+        let wrap = RateLimitMiddleware::new(inner.clone(), cfg);
+        let payload = vec![42u8; 4096];
+        wrap.put(&payload, &PutHint::default()).await.unwrap();
+        let ptrs = inner.seen_ptrs.lock().await.clone();
+        assert_eq!(ptrs.len(), 4, "fail_first=3 + 1 success");
+        // All four attempts must share the same backing buffer.
+        let unique: std::collections::HashSet<_> = ptrs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            1,
+            "expected single shared backing buffer across retries, got {ptrs:?}"
+        );
     }
 
     #[tokio::test]
