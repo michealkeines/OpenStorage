@@ -141,6 +141,7 @@ pub fn router(state: AppState) -> Router {
             get(list_inbox),
         )
         .route("/v1/vaults/:vault_id/snapshot/push", post(push_snapshot_route))
+        .route("/v1/vaults/:vault_id/snapshot/pull", post(pull_snapshot_route))
         .route(
             "/v1/vaults/:vault_id/files/*path",
             get(get_file)
@@ -1286,10 +1287,27 @@ async fn list_inbox(
     Ok(Json(serde_json::json!({ "inbox": arr })))
 }
 
+/// F-SN-1 query/body parameters.
+#[derive(Deserialize, Default)]
+struct PushSnapshotReq {
+    /// Pointer-CAS guard (RESILIENCE rollback detection). When present,
+    /// the push fails with 409 if the local vault's
+    /// `snapshot_pointer.version_counter` doesn't equal this value.
+    #[serde(default)]
+    expected_version_counter: Option<u64>,
+    /// Differential-push watermark: only File records whose
+    /// `modified_at.hlc.physical` is strictly greater than this value are
+    /// included. Other CFs are always serialized in full.
+    #[serde(default)]
+    delta_since_hlc_physical: Option<u64>,
+}
+
 async fn push_snapshot_route(
     State(s): State<AppState>,
     Path(vault_id): Path<String>,
+    body: Option<Json<PushSnapshotReq>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let req = body.map(|j| j.0).unwrap_or_default();
     let v = parse_vault_id(&vault_id)?;
     let mut vault = s
         .vault
@@ -1297,6 +1315,14 @@ async fn push_snapshot_route(
         .get_vault(v)
         .map_err(|e| ApiError::bad(format!("get_vault: {e}")))?
         .ok_or_else(|| ApiError::not_found("vault"))?;
+    if let Some(expected) = req.expected_version_counter {
+        if vault.snapshot_pointer.version_counter.0 != expected {
+            return Err(ApiError::conflict(format!(
+                "pointer CAS mismatch: have {}, expected {}",
+                vault.snapshot_pointer.version_counter.0, expected
+            )));
+        }
+    }
 
     let mk = s
         .vault
@@ -1325,6 +1351,16 @@ async fn push_snapshot_route(
             .map_err(|e| ApiError::bad(format!("scan: {e}")))?
         {
             let (k, val) = kv.map_err(|e| ApiError::bad(format!("scan: {e}")))?;
+            // Differential-push filter on Files CF.
+            if cf == os_metadata::ColumnFamily::Files {
+                if let Some(since) = req.delta_since_hlc_physical {
+                    if let Ok(file) = ciborium::from_reader::<os_entities::File, _>(&val[..]) {
+                        if file.modified_at.hlc.physical <= since {
+                            continue;
+                        }
+                    }
+                }
+            }
             entries.push((format!("{}/{}", cf.as_str(), hex::encode(k)), val));
         }
     }
@@ -1356,24 +1392,52 @@ async fn push_snapshot_route(
     let etag = os_crypto::blake3_32(&blob);
     let snapshot_id = blob[..12].to_vec();
 
-    // Push to the first registered vault provider.
+    // Push to the first registered vault provider via the universal
+    // `put` API (handle-based), then verify by peeking the returned
+    // handle. The signed-pointer CAS happens on the local Vault record
+    // — the on-plugin pointer would need a name-keyed slot which not
+    // every backend exposes consistently.
     let vps = s.host.list_vault();
+    let mut verify_failed = false;
+    let mut put_handle_hex: Option<String> = None;
     let pushed_to: Option<String> = if let Some(provider_id) = vps.first() {
         let vp = s
             .host
             .get_vault(*provider_id)
             .map_err(|e| ApiError::bad(format!("get_vault_plugin: {e}")))?;
-        let name = format!("snapshot/{}/v{}", v, vault.snapshot_pointer.version_counter.0 + 1);
-        match vp.cas_write(&name, &blob, None).await {
-            Ok(r) => match r.outcome {
-                os_plugin_host::CasOutcome::Written => Some(name),
-                _ => None,
-            },
+        match vp
+            .put(&blob, &os_entities::PutHint::default())
+            .await
+        {
+            Ok(put_result) => {
+                put_handle_hex = Some(hex::encode(&put_result.handle.0));
+                // F-SN-1 verify-after-upload: peek the freshly written
+                // handle and confirm its size matches what we sent.
+                if let Ok(peek) = vp.peek(&put_result.handle).await {
+                    if !peek.exists || peek.size != blob.len() as u64 {
+                        verify_failed = true;
+                    } else if let Some(remote_etag) = peek.etag {
+                        if remote_etag != etag {
+                            verify_failed = true;
+                        }
+                    }
+                }
+                if verify_failed {
+                    None
+                } else {
+                    Some(provider_id.to_string())
+                }
+            }
             Err(_) => None,
         }
     } else {
         None
     };
+    if verify_failed {
+        return Err(ApiError::bad(
+            "verify-after-upload mismatch; pointer not advanced",
+        ));
+    }
 
     vault.snapshot_pointer.version_counter =
         os_types::MonotonicCounter(vault.snapshot_pointer.version_counter.0 + 1);
@@ -1396,6 +1460,7 @@ async fn push_snapshot_route(
         "blob_bytes": blob.len(),
         "entries": entries.len(),
         "pushed_to_vault_provider": pushed_to,
+        "snapshot_handle_hex": put_handle_hex,
     })))
 }
 
@@ -1444,6 +1509,128 @@ async fn system_rebalance(
         .rebalance_on_plugin_add(&s.vault.store(), req.fraction_per_thousand.unwrap_or(100))
         .map_err(|e| ApiError::bad(format!("rebalance: {e}")))?;
     Ok(Json(serde_json::json!({ "enqueued": n })))
+}
+
+/// F-SN-2 — pull request body. The recipient identifies the snapshot by
+/// the `snapshot_handle_hex` the pusher recorded.
+#[derive(Deserialize)]
+struct PullSnapshotReq {
+    /// Hex-encoded provider-side handle returned by the push route.
+    snapshot_handle_hex: String,
+}
+
+/// F-SN-2 Cold-Start Snapshot Pull. Fetches the named blob from the first
+/// registered vault provider, AEAD-decrypts it under the snapshot subkey,
+/// CBOR-decodes the entry list, and writes each entry back into the
+/// matching column family. Idempotent — re-pulling the same blob yields
+/// the same store state.
+async fn pull_snapshot_route(
+    State(s): State<AppState>,
+    Path(vault_id): Path<String>,
+    Json(req): Json<PullSnapshotReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let v = parse_vault_id(&vault_id)?;
+    let mk = s
+        .vault
+        .master_key()
+        .ok_or_else(|| ApiError::locked("pull_snapshot: vault must be Unlocked"))?;
+    let vps = s.host.list_vault();
+    let provider_id = vps
+        .first()
+        .ok_or_else(|| ApiError::bad("no vault provider registered"))?;
+    let vp = s
+        .host
+        .get_vault(*provider_id)
+        .map_err(|e| ApiError::bad(format!("get_vault_plugin: {e}")))?;
+    let handle_bytes = hex_decode(&req.snapshot_handle_hex)
+        .ok_or_else(|| ApiError::bad("snapshot_handle_hex not hex"))?;
+    let handle = os_entities::NativeHandle(handle_bytes);
+    let blob = vp
+        .get(&handle, None)
+        .await
+        .map_err(|e| ApiError::not_found(format!("snapshot fetch: {e}")))?;
+    if blob.len() < 12 + 16 {
+        return Err(ApiError::bad("snapshot blob too short"));
+    }
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&blob[..12]);
+    let nonce = os_types::AeadNonce::N12(nonce_bytes);
+    let ct_end = blob.len() - 16;
+    let ct = &blob[12..ct_end];
+    let mut tag_bytes = [0u8; 16];
+    tag_bytes.copy_from_slice(&blob[ct_end..]);
+    let tag = os_types::AeadTag(tag_bytes);
+    let snap_key = os_crypto::derive_subkey(&mk, os_types::KeyPurpose::SNAPSHOT, None)
+        .map_err(|e| ApiError::bad(format!("derive: {e:?}")))?;
+    let aad = format!("snapshot:{}", v);
+    let plaintext = os_crypto::decrypt(
+        os_types::AeadSuite::ChaCha20Poly1305,
+        &snap_key,
+        &nonce,
+        ct,
+        &tag,
+        aad.as_bytes(),
+    )
+    .map_err(|_| ApiError::bad("snapshot AEAD verification failed"))?;
+    let entries: Vec<(String, Vec<u8>)> =
+        ciborium::from_reader(&plaintext[..])
+            .map_err(|e| ApiError::bad(format!("snapshot decode: {e}")))?;
+
+    let backend = s.vault.store().backend();
+    let mut applied = 0usize;
+    for (key, value) in &entries {
+        let (cf_name, hex_key) = match key.split_once('/') {
+            Some(p) => p,
+            None => continue,
+        };
+        let cf = match cf_name {
+            "files" => os_metadata::ColumnFamily::Files,
+            "chunks" => os_metadata::ColumnFamily::Chunks,
+            "shards" => os_metadata::ColumnFamily::Shards,
+            "shadows" => os_metadata::ColumnFamily::Shadows,
+            "providers" => os_metadata::ColumnFamily::Providers,
+            "identity" => os_metadata::ColumnFamily::Identity,
+            "peers" => os_metadata::ColumnFamily::Peers,
+            "shares" => os_metadata::ColumnFamily::Shares,
+            "devices" => os_metadata::ColumnFamily::Devices,
+            _ => continue,
+        };
+        let raw_key = match hex_decode(hex_key) {
+            Some(k) => k,
+            None => continue,
+        };
+        let mut txn = os_metadata::Txn::new();
+        txn.put(cf, raw_key, value.clone());
+        backend
+            .commit(txn)
+            .map_err(|e| ApiError::bad(format!("apply: {e}")))?;
+        applied += 1;
+    }
+    Ok(Json(serde_json::json!({
+        "applied": applied,
+        "entries": entries.len(),
+        "snapshot_handle_hex": req.snapshot_handle_hex,
+    })))
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let h = match (bytes[i] as char).to_digit(16) {
+            Some(v) => v,
+            None => return None,
+        };
+        let l = match (bytes[i + 1] as char).to_digit(16) {
+            Some(v) => v,
+            None => return None,
+        };
+        out.push(((h << 4) | l) as u8);
+    }
+    Some(out)
 }
 
 async fn get_fault(State(s): State<AppState>) -> Json<serde_json::Value> {
@@ -2327,6 +2514,252 @@ mod tests {
         let body = axum::body::to_bytes(g.into_body(), 8192).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["active_token_count"].as_u64().unwrap(), 1);
+    }
+
+    /// F-SN-2 — push then pull round-trip restores the snapshot's File
+    /// rows. Author a file → push → mutate locally → pull → confirm
+    /// the original content reappears.
+    #[tokio::test]
+    async fn push_then_pull_round_trip() {
+        // Build a router with a LocalDirPlugin registered as a vault
+        // provider so push has somewhere to write the snapshot blob and
+        // pull can fetch it back.
+        use os_plugin_host::LocalDirPlugin;
+        let store = Arc::new(Store::new(Arc::new(MemoryBackend::new())));
+        let host = Arc::new(Host::new());
+        let mut tdir = std::env::temp_dir();
+        tdir.push(format!("os-snap-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tdir).unwrap();
+        let provider_id = os_types::ProviderId::new_v7();
+        host.register_vault(
+            provider_id,
+            Arc::new(LocalDirPlugin::new(tdir.join("vault")).unwrap()),
+        );
+        let identity = Arc::new(IdentityService::new(store.clone()));
+        let vault = Arc::new(VaultManager::new(store.clone(), host.clone()));
+        let (sk, _pk) = generate_keypair(&mut OsRng);
+        let device_id = DeviceId::new_v7();
+        let wal = WalBuilder::new()
+            .path(tdir.join("wal.bin"))
+            .build(device_id, sk)
+            .unwrap();
+        let sync = Arc::new(SyncEngine::new(Arc::new(wal)));
+        let recovery = Arc::new(RecoveryService::new(
+            store.clone(),
+            identity.clone(),
+            vault.clone(),
+        ));
+        let vfs = Arc::new(VfsService::new(store.clone(), vault.clone(), sync));
+        let lease = Arc::new(os_lease::LeaseService::new());
+        let repair = Arc::new(os_repair::RepairScheduler::new(1024));
+        let events = Arc::new(os_events::EventBus::new());
+        let share = Arc::new(os_share::ShareService::new(store.clone(), vfs.clone()));
+        let app = router(AppState {
+            recovery,
+            vault,
+            vfs,
+            identity,
+            lease,
+            repair,
+            events,
+            host,
+            share,
+            device_id,
+            fault: None,
+            plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        });
+        let vault_id = create_vault_for_test(&app).await;
+
+        // Author a file with original content.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/snap.txt"))
+                    .body(Body::from("original-content"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Push the snapshot.
+        let push = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/snapshot/push"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(push.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(push.into_body(), 65536).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let handle_hex = parsed["snapshot_handle_hex"]
+            .as_str()
+            .expect("snapshot_handle_hex should be present after a successful push")
+            .to_string();
+
+        // Mutate the file locally to a different value.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/snap.txt"))
+                    .body(Body::from("mutated-content-after-push"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Pull the snapshot. The pulled records overwrite local rows
+        // for the same keys.
+        let pull = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/snapshot/pull"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"snapshot_handle_hex": handle_hex}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pull.status(), StatusCode::OK);
+
+        // Confirm the file now reads back the *original* content.
+        let read = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/files/snap.txt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(read.into_body(), 16384).await.unwrap();
+        assert_eq!(&body[..], b"original-content");
+    }
+
+    /// F-SN-1 — push with `expected_version_counter` matching local
+    /// pointer succeeds; mismatch returns 409.
+    #[tokio::test]
+    async fn push_snapshot_cas_pointer() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        // Local pointer starts at version_counter=0.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/snapshot/push"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"expected_version_counter": 99}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::CONFLICT);
+
+        let ok = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/snapshot/push"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"expected_version_counter": 0}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(ok.into_body(), 65536).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["version_counter"].as_u64().unwrap(), 1);
+    }
+
+    /// F-SN-1 — `delta_since_hlc_physical` filters File entries.
+    #[tokio::test]
+    async fn push_snapshot_delta_filter() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        // Two files written in sequence so they have distinct HLCs.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/old"))
+                    .body(Body::from("first"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/new"))
+                    .body(Body::from("second"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Full push: 2 file entries.
+        let full = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/snapshot/push"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(full.into_body(), 65536).await.unwrap();
+        let parsed_full: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let full_entries = parsed_full["entries"].as_u64().unwrap();
+        assert!(full_entries >= 2, "expected ≥ 2 entries in full push");
+
+        // Delta with a watermark above the universe filters all File rows.
+        let delta = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/snapshot/push"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"delta_since_hlc_physical": u64::MAX - 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(delta.into_body(), 65536).await.unwrap();
+        let parsed_delta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let delta_entries = parsed_delta["entries"].as_u64().unwrap();
+        assert!(
+            delta_entries < full_entries,
+            "delta entries ({delta_entries}) should drop below full ({full_entries})"
+        );
     }
 
     /// F-HM-1 / F-HM-5 — POST /v1/system/scrub and /gc enqueue tasks

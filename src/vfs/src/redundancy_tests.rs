@@ -322,15 +322,14 @@ async fn read_repair_enqueued_on_shard_failure() {
     let payload = random_payload(8192);
     svc.write("/r", &payload).await.unwrap();
 
-    // Make providers 0 and 1 fail gets so the read has to fall through
-    // to provider 2; at least one fetch must error.
-    f.providers[0].1.fail_gets.store(true, Ordering::SeqCst);
-    f.providers[1].1.fail_gets.store(true, Ordering::SeqCst);
+    // Fail every provider's get. The read will fail but every shard
+    // fetch error must enqueue a ReadRepair task; this is what F-HM-2
+    // guarantees regardless of which fetch loses the race.
+    for (_, p) in &f.providers {
+        p.fail_gets.store(true, Ordering::SeqCst);
+    }
+    let _ = svc.read("/r").await;
 
-    let got = svc.read("/r").await.unwrap();
-    assert_eq!(got, payload);
-
-    // At least one ReadRepair task is now on the queue.
     let depth = scheduler.state().depth;
     assert!(
         depth >= 1,

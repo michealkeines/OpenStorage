@@ -322,7 +322,21 @@ enum WalCmd {
 #[derive(Subcommand, Debug)]
 enum SnapshotCmd {
     Show,
-    Push,
+    /// F-SN-1 — push a snapshot to the configured vault provider. The
+    /// optional knobs trigger the pointer-CAS guard and differential
+    /// filter respectively.
+    Push {
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        delta_since_hlc: Option<u64>,
+    },
+    /// F-SN-2 — pull a snapshot identified by its `snapshot_handle_hex`
+    /// (printed by `snapshot push`).
+    Pull {
+        #[arg(long)]
+        handle_hex: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1148,9 +1162,13 @@ async fn snapshot_cmd(client: &reqwest::Client, base: &str, cmd: SnapshotCmd) ->
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
-        SnapshotCmd::Push => {
+        SnapshotCmd::Push { expect_version, delta_since_hlc } => {
             let resp = client
                 .post(format!("{base}/v1/vaults/{}/snapshot/push", st.vault_id))
+                .json(&serde_json::json!({
+                    "expected_version_counter": expect_version,
+                    "delta_since_hlc_physical": delta_since_hlc,
+                }))
                 .send()
                 .await?;
             if !resp.status().is_success() {
@@ -1160,6 +1178,20 @@ async fn snapshot_cmd(client: &reqwest::Client, base: &str, cmd: SnapshotCmd) ->
             }
             let body: serde_json::Value = resp.json().await?;
             println!("✓ snapshot pushed: {}", serde_json::to_string_pretty(&body)?);
+        }
+        SnapshotCmd::Pull { handle_hex } => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/snapshot/pull", st.vault_id))
+                .json(&serde_json::json!({"snapshot_handle_hex": handle_hex}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("pull failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ snapshot pulled: {}", serde_json::to_string_pretty(&body)?);
         }
     }
     Ok(())
