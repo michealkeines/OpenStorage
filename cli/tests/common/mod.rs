@@ -15,6 +15,7 @@ use os_metadata::Store;
 use os_plugin_host::Host;
 use os_recovery::RecoveryService;
 use os_repair::RepairScheduler;
+use os_share::ShareService;
 use os_sync::SyncEngine;
 use os_types::DeviceId;
 use os_vault::VaultManager;
@@ -49,10 +50,11 @@ pub async fn spawn_engine() -> Engine {
         identity.clone(),
         vault.clone(),
     ));
-    let vfs = Arc::new(VfsService::new(store, vault.clone(), sync));
+    let vfs = Arc::new(VfsService::new(store.clone(), vault.clone(), sync));
     let lease = Arc::new(LeaseService::new());
     let repair = Arc::new(RepairScheduler::new(1024));
     let events = Arc::new(EventBus::new());
+    let share = Arc::new(ShareService::new(store, vfs.clone()));
     let app = router(AppState {
         recovery,
         vault,
@@ -62,6 +64,7 @@ pub async fn spawn_engine() -> Engine {
         repair,
         events,
         host,
+        share,
         device_id,
         fault: None,
         plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),

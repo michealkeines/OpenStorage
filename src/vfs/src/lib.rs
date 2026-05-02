@@ -247,9 +247,10 @@ impl VfsService {
 
         // Chunked path. We've already read the first chunk's worth of bytes
         // into `head`; treat that as the start of the stream.
-        // Per F-FL-5 the file_key is bound to the stable `file_id`, not to
-        // the path (which is a mutable LWW field).
-        let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(file_id.as_uuid().as_bytes()))?;
+        // Per F-FL-5 the file_key is bound to the stable `file_id` and
+        // `file_key_version` (bumped by F-SH-3 revoke), not to the path.
+        let file_key_version = existing.as_ref().map(|f| f.file_key_version).unwrap_or(0);
+        let file_key = derive_file_key(&mk, file_id, file_key_version)?;
         let vault_salt: Option<Vec<u8>> = self
             .vault
             .vault_id()
@@ -368,6 +369,7 @@ impl VfsService {
                 wrapped_keys: OrSet::new(),
                 acl: OrSet::new(),
                 exists: LwwRegister::new(true, hlc, device),
+                file_key_version: 0,
             },
         };
         let mut txn = Txn::new();
@@ -404,8 +406,9 @@ impl VfsService {
         now: &Timestamp,
         existing: Option<File>,
     ) -> Result<FileMeta, VfsError> {
-        let file_key = derive_subkey(mk, KeyPurpose::FILE, Some(file_id.as_uuid().as_bytes()))?;
-        let aad = inline_aad(file_id);
+        let file_key_version = existing.as_ref().map(|f| f.file_key_version).unwrap_or(0);
+        let file_key = derive_file_key(mk, file_id, file_key_version)?;
+        let aad = inline_aad(file_id, file_key_version);
         let nonce = random_nonce_12();
         let (ct, tag) = aead_encrypt(self.cfg.aead_suite, &file_key, &nonce, bytes, &aad)?;
         let hlc = next_hlc(&self.sync);
@@ -440,6 +443,7 @@ impl VfsService {
                 wrapped_keys: OrSet::new(),
                 acl: OrSet::new(),
                 exists: LwwRegister::new(true, hlc, device),
+                file_key_version: 0,
             },
         };
         let mut txn = Txn::new();
@@ -744,8 +748,8 @@ impl VfsService {
 
         // Inline → single-shot stream.
         if let Some(payload) = file.inline_payload.clone() {
-            let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(file.file_id.as_uuid().as_bytes()))?;
-            let aad = inline_aad(file.file_id);
+            let file_key = derive_file_key(&mk, file.file_id, file.file_key_version)?;
+            let aad = inline_aad(file.file_id, file.file_key_version);
             let pt = aead_decrypt(
                 self.cfg.aead_suite,
                 &file_key,
@@ -764,7 +768,7 @@ impl VfsService {
         let cfg = self.cfg;
         let store = self.store.clone();
         let plugin_host = self.plugin_host.clone();
-        let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(file.file_id.as_uuid().as_bytes()))?;
+        let file_key = derive_file_key(&mk, file.file_id, file.file_key_version)?;
         let fetch_concurrency = cfg.chunk_fetch_concurrency.max(1);
         let read_hedge = cfg.read_hedge as usize;
         let stream = async_stream::try_stream! {
@@ -873,6 +877,60 @@ impl VfsService {
             content_type: file.content_type.value,
             exists: file.exists.value,
         })
+    }
+
+    /// F-SH-3 helper: bump a file's `file_key_version`, derive a fresh
+    /// file_key, and re-encrypt the inline payload (if any) under it.
+    /// Chunked payloads are flagged for async re-encryption — the spec
+    /// says "heavy — async via repair scheduler" and the chunked rewrite
+    /// is owned by `repair/`.
+    pub fn rotate_file_key(&self, file_id: FileId) -> Result<u64, VfsError> {
+        let mk = self.vault.master_key().ok_or(VfsError::VaultLocked)?;
+        let mut file = self
+            .store
+            .get_file(file_id)?
+            .ok_or_else(|| VfsError::NotFound(file_id.to_string()))?;
+        let new_version = file.file_key_version + 1;
+        if let Some(payload) = file.inline_payload.clone() {
+            let old_key = derive_file_key(&mk, file_id, file.file_key_version)?;
+            let pt = aead_decrypt(
+                self.cfg.aead_suite,
+                &old_key,
+                &payload.nonce,
+                &payload.ciphertext,
+                &payload.tag,
+                &inline_aad(file_id, file.file_key_version),
+            )?;
+            let new_key = derive_file_key(&mk, file_id, new_version)?;
+            let nonce = random_nonce_12();
+            let (ct, tag) = aead_encrypt(
+                self.cfg.aead_suite,
+                &new_key,
+                &nonce,
+                &pt,
+                &inline_aad(file_id, new_version),
+            )?;
+            file.inline_payload = Some(InlineBlob {
+                ciphertext: ct,
+                nonce,
+                tag,
+            });
+        }
+        file.file_key_version = new_version;
+        let mut txn = Txn::new();
+        self.store.put_file(&mut txn, &file)?;
+        self.store.commit(txn)?;
+        Ok(new_version)
+    }
+
+    /// Read the current `file_key_version` for a file. Used by sharing to
+    /// derive the file_key of a specific generation for KEM wrapping.
+    pub fn file_key_version(&self, file_id: FileId) -> Result<u64, VfsError> {
+        let f = self
+            .store
+            .get_file(file_id)?
+            .ok_or_else(|| VfsError::NotFound(file_id.to_string()))?;
+        Ok(f.file_key_version)
     }
 
     pub fn stat(&self, path: &str) -> Result<FileMeta, VfsError> {
@@ -1122,14 +1180,29 @@ fn group_lookup(
     out
 }
 
-/// AAD for inline file payloads. Bound to the stable `file_id` only — the
-/// path is an LWW field that can change via F-FL-5 (rename) without
-/// re-encryption, so it must not be part of the ciphertext binding.
-fn inline_aad(file_id: FileId) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8 + 16);
+/// AAD for inline file payloads. Bound to `(file_id, file_key_version)` —
+/// the version makes ciphertext from a previous key generation
+/// non-decryptable after F-SH-3 rotates.
+fn inline_aad(file_id: FileId, file_key_version: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 16 + 8);
     v.extend_from_slice(b"inline:");
     v.extend_from_slice(file_id.as_uuid().as_bytes());
+    v.extend_from_slice(&file_key_version.to_be_bytes());
     v
+}
+
+/// Derive the per-file symmetric key. Bound to MK + file_id +
+/// file_key_version. Sharing exposes this same key to recipients via KEM
+/// wrap; revocation bumps the version so revoked recipients lose access.
+pub fn derive_file_key(
+    mk: &os_crypto::SymKey,
+    file_id: FileId,
+    version: u64,
+) -> Result<os_crypto::SymKey, os_crypto::CryptoError> {
+    let mut info = Vec::with_capacity(16 + 8);
+    info.extend_from_slice(file_id.as_uuid().as_bytes());
+    info.extend_from_slice(&version.to_be_bytes());
+    derive_subkey(mk, KeyPurpose::FILE, Some(&info))
 }
 
 fn next_hlc(sync: &SyncEngine) -> Hlc {

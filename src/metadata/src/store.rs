@@ -287,7 +287,7 @@ mod tests {
             chunk_list: None,
             wrapped_keys: OrSet::new(),
             acl: OrSet::new(),
-            exists: LwwRegister::new(true, Hlc::new(1, 0), d),
+            exists: LwwRegister::new(true, Hlc::new(1, 0), d), file_key_version: 0,
         };
         let mut t = Txn::new();
         store.put_file(&mut t, &f).unwrap();
@@ -315,7 +315,7 @@ mod tests {
             chunk_list: None,
             wrapped_keys: OrSet::new(),
             acl: OrSet::new(),
-            exists: LwwRegister::new(true, Hlc::new(1, 0), d),
+            exists: LwwRegister::new(true, Hlc::new(1, 0), d), file_key_version: 0,
         };
         let mut t = Txn::new();
         store.put_file(&mut t, &f).unwrap();
@@ -344,7 +344,7 @@ mod tests {
                 chunk_list: None,
                 wrapped_keys: OrSet::new(),
                 acl: OrSet::new(),
-                exists: LwwRegister::new(true, Hlc::new(1, 0), d),
+                exists: LwwRegister::new(true, Hlc::new(1, 0), d), file_key_version: 0,
             };
             store.put_file(&mut t, &f).unwrap();
             store.commit(t).unwrap();
@@ -378,7 +378,7 @@ mod tests {
                 chunk_list: None,
                 wrapped_keys: OrSet::new(),
                 acl: OrSet::new(),
-                exists: LwwRegister::new(true, Hlc::new(1, 0), d),
+                exists: LwwRegister::new(true, Hlc::new(1, 0), d), file_key_version: 0,
             };
             store.put_file(&mut t, &f).unwrap();
             store.commit(t).unwrap();

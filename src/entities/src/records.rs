@@ -49,6 +49,11 @@ pub struct File {
     pub wrapped_keys: OrSet<WrappedKey>,
     pub acl: OrSet<AclEntry>,
     pub exists: LwwRegister<bool>,
+    /// Per-file key generation. Bumped on F-SH-3 revoke so the file_key
+    /// derivation produces a fresh key; ciphertext on chunks/inline must be
+    /// re-encrypted under the new key after a bump.
+    #[serde(default)]
+    pub file_key_version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

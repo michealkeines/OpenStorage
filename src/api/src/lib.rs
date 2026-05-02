@@ -32,6 +32,10 @@ use os_lease::LeaseService;
 use os_plugin_host::Host;
 use os_recovery::RecoveryService;
 use os_repair::RepairScheduler;
+use os_share::{
+    decode_blob as share_decode_blob, encode_blob as share_encode_blob,
+    CreateShareReq as ShareCreateReq, ShareService,
+};
 use os_types::VaultId;
 use os_vault::VaultManager;
 use os_vfs::VfsService;
@@ -46,6 +50,7 @@ pub struct AppState {
     pub repair: Arc<RepairScheduler>,
     pub events: Arc<EventBus>,
     pub host: Arc<Host>,
+    pub share: Arc<ShareService>,
     pub device_id: os_types::DeviceId,
     /// Optional fault handle for integration tests.
     pub fault: Option<FaultHandleAny>,
@@ -125,6 +130,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/vaults/:vault_id/shares/:share_id",
             axum::routing::delete(revoke_share),
+        )
+        .route(
+            "/v1/vaults/:vault_id/inbox/:share_id/accept",
+            post(accept_share),
+        )
+        .route(
+            "/v1/vaults/:vault_id/inbox",
+            get(list_inbox),
         )
         .route("/v1/vaults/:vault_id/snapshot/push", post(push_snapshot_route))
         .route(
@@ -992,55 +1005,190 @@ async fn create_share(
     } else {
         os_entities::ShareScope::File(req.scope.clone())
     };
-    let share = os_entities::Share {
-        share_id: os_types::ShareId::new_v7(),
-        scope,
-        recipient: os_types::PeerId(req.recipient.clone()),
-        permissions: vec![os_entities::Permission::Read],
-        wrapped_keys_ref: os_entities::WrappedKeyRef {
-            file_id: os_types::FileId::new_v7(),
-            or_set_add_id: 0,
-        },
-        created_at: os_types::Timestamp::from_string("now"),
-        expires_at: None,
-        revoked_at: None,
+    // Resolve file_id from path (only File-scope shares are supported in
+    // this slice; folder/vault scopes share the same crypto with broader
+    // permissions and are layered on later).
+    let file_path = match &scope {
+        os_entities::ShareScope::File(p) => p.clone(),
+        _ => return Err(ApiError::bad("only file-scope shares are supported")),
     };
-    let id = share.share_id;
-    let mut txn = os_metadata::Txn::new();
-    s.vault
-        .store()
-        .put_share(&mut txn, &share)
-        .map_err(|e| ApiError::bad(format!("put_share: {e}")))?;
-    s.vault
-        .store()
-        .commit(txn)
-        .map_err(|e| ApiError::bad(format!("commit: {e}")))?;
-    Ok(Json(serde_json::json!({ "share_id": id.to_string(), "state": "created" })))
+    let meta = s
+        .vfs
+        .stat(&file_path)
+        .map_err(|e| ApiError::not_found(format!("stat: {e}")))?;
+
+    // Resolve or auto-create the recipient peer to fetch its KEM pubkey
+    // (test-mode behavior matches the prior stub).
+    let recipient = os_types::PeerId(req.recipient.clone());
+    let backend = s.vault.store().backend();
+    let mut peer_kem: Option<os_types::MlKemPub> = None;
+    let mut peer_sign: Option<os_types::Ed25519Pub> = None;
+    for kv in backend
+        .scan_prefix(os_metadata::ColumnFamily::Peers, b"")
+        .map_err(|e| ApiError::bad(format!("scan: {e}")))?
+    {
+        let (_, v) = kv.map_err(|e| ApiError::bad(format!("scan: {e}")))?;
+        let p: os_entities::Peer = ciborium::from_reader(&v[..])
+            .map_err(|e| ApiError::bad(format!("decode: {e}")))?;
+        if p.peer_id == recipient {
+            if let Some(epoch) = p.epochs.last() {
+                peer_kem = Some(epoch.kem_pubkey.clone());
+                peer_sign = Some(epoch.sign_pubkey);
+            }
+            break;
+        }
+    }
+    let _ = peer_sign;
+    let recipient_kem = peer_kem.unwrap_or_else(|| os_types::MlKemPub(vec![13u8; 32]));
+
+    let mk = s
+        .vault
+        .master_key()
+        .ok_or_else(|| ApiError::locked("create_share: vault locked"))?;
+    let mk_sym = os_crypto::SymKey::from_bytes(*mk.as_bytes());
+    // Owner signing key derived from MK under the share-sign domain. This
+    // mirrors the stub used by /identity/rotate; per F-SH-1 the real
+    // wiring uses the current epoch's persisted priv key.
+    let owner_priv_bytes =
+        os_crypto::derive_subkey(&mk_sym, os_types::KeyPurpose::WAL_SIGN, Some(b"share-owner"))
+            .map_err(|e| ApiError::bad(format!("derive owner_priv: {e:?}")))?;
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(owner_priv_bytes.as_bytes());
+    let owner_priv = os_types::Ed25519Priv(sk_bytes);
+    let owner_pub = os_crypto::ed25519_pub_from_priv(&owner_priv);
+
+    let creq = ShareCreateReq {
+        file_id: meta.file_id,
+        scope,
+        permissions: vec![os_entities::Permission::Read],
+        owner_peer_id: os_types::PeerId("self".into()),
+        owner_epoch_id: os_types::EpochId(0),
+        owner_sign_priv: &owner_priv,
+        recipient_peer_id: recipient,
+        recipient_kem_pub: &recipient_kem,
+        master_key: &mk_sym,
+        now: os_types::Timestamp::from_string("now"),
+        expires_at: None,
+    };
+    let (share, blob) = s
+        .share
+        .create_share(creq)
+        .map_err(|e| ApiError::bad(format!("create_share: {e}")))?;
+    let blob_bytes = share_encode_blob(&blob)
+        .map_err(|e| ApiError::bad(format!("encode_blob: {e}")))?;
+    Ok(Json(serde_json::json!({
+        "share_id": share.share_id.to_string(),
+        "state": "created",
+        "blob_hex": hex::encode(&blob_bytes),
+        "owner_sign_pub_hex": hex::encode(owner_pub.0),
+    })))
 }
 
 async fn revoke_share(
     State(s): State<AppState>,
     Path((_vault_id, share_id)): Path<(String, String)>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let u = uuid::Uuid::parse_str(&share_id).map_err(|_| ApiError::bad("invalid share_id"))?;
     let id = os_types::ShareId::from_uuid(u);
-    let mut share = s
-        .vault
-        .store()
-        .get_share(id)
-        .map_err(|e| ApiError::bad(format!("get_share: {e}")))?
-        .ok_or_else(|| ApiError::not_found("share"))?;
-    share.revoked_at = Some(os_types::Timestamp::from_string("now"));
-    let mut txn = os_metadata::Txn::new();
-    s.vault
-        .store()
-        .put_share(&mut txn, &share)
-        .map_err(|e| ApiError::bad(format!("put_share: {e}")))?;
-    s.vault
-        .store()
-        .commit(txn)
-        .map_err(|e| ApiError::bad(format!("commit: {e}")))?;
-    Ok(StatusCode::NO_CONTENT)
+    let new_v = s
+        .share
+        .revoke_share(id, os_types::Timestamp::from_string("now"))
+        .map_err(|e| match e {
+            os_share::ShareError::NotFound(_) => ApiError::not_found("share"),
+            os_share::ShareError::VaultLocked => ApiError::locked("revoke: vault locked"),
+            other => ApiError::bad(format!("revoke: {other}")),
+        })?;
+    Ok(Json(serde_json::json!({
+        "share_id": id.to_string(),
+        "state": "revoked",
+        "new_file_key_version": new_v,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AcceptShareReq {
+    /// Hex-encoded `ShareBlob` bytes.
+    blob_hex: String,
+    /// Hex-encoded owner's Ed25519 public key (32 bytes).
+    owner_sign_pub_hex: String,
+    /// Optional override for the local mount path. Defaults to
+    /// `/shared-with-me/{owner_peer_id}/{scope_path}`.
+    mount_path: Option<String>,
+}
+
+async fn accept_share(
+    State(s): State<AppState>,
+    Path((_vault_id, _share_id)): Path<(String, String)>,
+    Json(req): Json<AcceptShareReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let blob_bytes =
+        hex::decode(&req.blob_hex).map_err(|_| ApiError::bad("blob_hex not hex"))?;
+    let blob = share_decode_blob(&blob_bytes)
+        .map_err(|e| ApiError::bad(format!("decode_blob: {e}")))?;
+    let owner_pub_bytes = hex::decode(&req.owner_sign_pub_hex)
+        .map_err(|_| ApiError::bad("owner_sign_pub_hex not hex"))?;
+    if owner_pub_bytes.len() != 32 {
+        return Err(ApiError::bad("owner_sign_pub must be 32 bytes hex"));
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&owner_pub_bytes);
+    let owner_pub = os_types::Ed25519Pub(pk);
+    // Recipient KEM pubkey: same placeholder as create — in real
+    // deployments this is fetched from the local identity service.
+    let recipient_kem = os_types::MlKemPub(vec![13u8; 32]);
+    let mount_path = req.mount_path.unwrap_or_else(|| {
+        let scope_path = match &blob.scope {
+            os_entities::ShareScope::File(p) => p.clone(),
+            os_entities::ShareScope::Folder(p) => p.clone(),
+            os_entities::ShareScope::Vault => "/".into(),
+        };
+        format!("/shared-with-me/{}{}", blob.owner_peer_id.0, scope_path)
+    });
+    let received = s
+        .share
+        .accept_share(
+            &blob,
+            &owner_pub,
+            &recipient_kem,
+            mount_path.clone(),
+            os_types::Timestamp::from_string("now"),
+        )
+        .map_err(|e| match e {
+            os_share::ShareError::SignatureInvalid => {
+                ApiError::unauth("share signature invalid")
+            }
+            other => ApiError::bad(format!("accept: {other}")),
+        })?;
+    Ok(Json(serde_json::json!({
+        "share_id": received.share_id.to_string(),
+        "file_id": received.file_id.to_string(),
+        "file_key_version": received.file_key_version,
+        "mounted_path": received.mounted_path,
+        "state": "accepted",
+    })))
+}
+
+async fn list_inbox(
+    State(s): State<AppState>,
+    Path(_vault_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let xs = s
+        .share
+        .list_received()
+        .map_err(|e| ApiError::bad(format!("list_received: {e}")))?;
+    let arr: Vec<_> = xs
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "share_id": r.share_id.to_string(),
+                "owner_peer_id": r.owner_peer_id.0,
+                "file_id": r.file_id.to_string(),
+                "mounted_path": r.mounted_path,
+                "file_key_version": r.file_key_version,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "inbox": arr })))
 }
 
 async fn push_snapshot_route(
@@ -1303,10 +1451,11 @@ mod tests {
             identity.clone(),
             vault.clone(),
         ));
-        let vfs = Arc::new(VfsService::new(store, vault.clone(), sync));
+        let vfs = Arc::new(VfsService::new(store.clone(), vault.clone(), sync));
         let lease = Arc::new(os_lease::LeaseService::new());
         let repair = Arc::new(os_repair::RepairScheduler::new(1024));
         let events = Arc::new(os_events::EventBus::new());
+        let share = Arc::new(os_share::ShareService::new(store, vfs.clone()));
         router(AppState {
             recovery,
             vault,
@@ -1316,6 +1465,7 @@ mod tests {
             repair,
             events,
             host,
+            share,
             device_id,
             fault: None,
             plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
@@ -1797,6 +1947,207 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// F-SH-1 → F-SH-2 — owner creates a share via the API; the returned
+    /// blob and owner pubkey let the recipient accept it through the
+    /// /inbox/{share_id}/accept route. Verifies the inbox listing reflects
+    /// the accepted share.
+    #[tokio::test]
+    async fn share_create_and_accept_round_trip() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        // Author a file to share.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/secret.txt"))
+                    .body(Body::from("classified"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({ "recipient": "bob", "scope": "/secret.txt" });
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/shares"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(create.into_body(), 16384).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let share_id = parsed["share_id"].as_str().unwrap().to_string();
+        let blob_hex = parsed["blob_hex"].as_str().unwrap().to_string();
+        let owner_pub_hex = parsed["owner_sign_pub_hex"].as_str().unwrap().to_string();
+
+        let accept_body = serde_json::json!({
+            "blob_hex": blob_hex,
+            "owner_sign_pub_hex": owner_pub_hex,
+        });
+        let accept = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/inbox/{share_id}/accept"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(accept_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept.status(), StatusCode::OK);
+
+        let inbox = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/inbox"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(inbox.into_body(), 16384).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = parsed["inbox"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["share_id"].as_str().unwrap(), share_id);
+    }
+
+    /// F-SH-2 — accept with a tampered owner pubkey fails with 401.
+    #[tokio::test]
+    async fn share_accept_with_wrong_owner_pubkey_401() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/x"))
+                    .body(Body::from("data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/shares"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"recipient":"b","scope":"/x"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(create.into_body(), 16384).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let share_id = parsed["share_id"].as_str().unwrap().to_string();
+        let blob_hex = parsed["blob_hex"].as_str().unwrap().to_string();
+
+        let bogus_pub = hex::encode([0u8; 32]);
+        let accept_body = serde_json::json!({
+            "blob_hex": blob_hex,
+            "owner_sign_pub_hex": bogus_pub,
+        });
+        let accept = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/inbox/{share_id}/accept"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(accept_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// F-SH-3 — revoke bumps `file_key_version` and returns it. Revoke
+    /// twice should produce strictly increasing versions.
+    #[tokio::test]
+    async fn share_revoke_bumps_version() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/r.txt"))
+                    .body(Body::from("data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Two shares to two recipients.
+        let mut versions = Vec::new();
+        for recipient in ["b1", "b2"] {
+            let body = serde_json::json!({"recipient": recipient, "scope": "/r.txt"});
+            let create = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/vaults/{vault_id}/shares"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body =
+                axum::body::to_bytes(create.into_body(), 16384).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let share_id = parsed["share_id"].as_str().unwrap().to_string();
+
+            let rev = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/v1/vaults/{vault_id}/shares/{share_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rev.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(rev.into_body(), 16384).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            versions.push(parsed["new_file_key_version"].as_u64().unwrap());
+        }
+        assert_eq!(versions, vec![1, 2]);
+
+        // After revocation the file is still readable by the owner.
+        let g = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/files/r.txt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(g.into_body(), 16384).await.unwrap();
+        assert_eq!(&body[..], b"data");
     }
 
     /// 6.A.4 — POST /recovery/rotate-token returns a new token id and the

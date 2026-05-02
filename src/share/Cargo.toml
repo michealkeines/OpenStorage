@@ -13,4 +13,16 @@ os-metadata = { workspace = true }
 os-identity = { workspace = true }
 os-events = { workspace = true }
 os-wal = { workspace = true }
+os-vfs = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+os-vault = { workspace = true }
+os-sync = { workspace = true }
+os-plugin-host = { workspace = true }

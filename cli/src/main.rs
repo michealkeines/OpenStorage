@@ -351,7 +351,8 @@ enum RepairCmd {
 #[derive(Subcommand, Debug)]
 enum SharesCmd {
     Ls,
-    /// Create a share (test mode — KEM is a placeholder).
+    /// Create a share. Prints the signed blob and the owner pubkey the
+    /// recipient needs in order to accept.
     Create {
         /// PeerId. Use `peer:test-recipient` for the harness.
         #[arg(long)]
@@ -360,6 +361,21 @@ enum SharesCmd {
         #[arg(long)]
         scope: String,
     },
+    /// Accept a share previously created. Reads `--blob-hex` and
+    /// `--owner-pub-hex` from the create command's output.
+    Accept {
+        share_id: String,
+        #[arg(long = "blob-hex")]
+        blob_hex: String,
+        #[arg(long = "owner-pub-hex")]
+        owner_sign_pub_hex: String,
+        /// Optional override for the local mount path. Defaults to
+        /// `/shared-with-me/<owner>/<scope>`.
+        #[arg(long)]
+        mount: Option<String>,
+    },
+    /// List accepted shares (the recipient inbox).
+    Inbox,
     Revoke {
         share_id: String,
     },
@@ -1269,6 +1285,45 @@ async fn shares_cmd(client: &reqwest::Client, base: &str, cmd: SharesCmd) -> Res
             let body: serde_json::Value = resp.json().await?;
             println!("✓ share created: {}", serde_json::to_string_pretty(&body)?);
         }
+        SharesCmd::Accept { share_id, blob_hex, owner_sign_pub_hex, mount } => {
+            let url = format!(
+                "{base}/v1/vaults/{}/inbox/{share_id}/accept",
+                st.vault_id
+            );
+            let body = serde_json::json!({
+                "blob_hex": blob_hex,
+                "owner_sign_pub_hex": owner_sign_pub_hex,
+                "mount_path": mount,
+            });
+            let resp = client.post(&url).json(&body).send().await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("accept failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ share accepted: {}", serde_json::to_string_pretty(&body)?);
+        }
+        SharesCmd::Inbox => {
+            let url = format!("{base}/v1/vaults/{}/inbox", st.vault_id);
+            let resp = client.get(&url).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if let Some(arr) = body["inbox"].as_array() {
+                if arr.is_empty() {
+                    println!("(empty)");
+                } else {
+                    for sh in arr {
+                        println!(
+                            "- {} from={} mount={} key_v={}",
+                            sh["share_id"].as_str().unwrap_or("?"),
+                            sh["owner_peer_id"].as_str().unwrap_or("?"),
+                            sh["mounted_path"].as_str().unwrap_or("?"),
+                            sh["file_key_version"].as_u64().unwrap_or(0),
+                        );
+                    }
+                }
+            }
+        }
         SharesCmd::Revoke { share_id } => {
             let resp = client.delete(format!("{url}/{share_id}")).send().await?;
             if !resp.status().is_success() {
@@ -1276,7 +1331,11 @@ async fn shares_cmd(client: &reqwest::Client, base: &str, cmd: SharesCmd) -> Res
                 let b = resp.text().await.unwrap_or_default();
                 bail!("revoke failed: {s} {b}");
             }
-            println!("✓ share revoked");
+            let body: serde_json::Value = resp.json().await?;
+            println!(
+                "✓ share revoked (file_key_version → {})",
+                body["new_file_key_version"].as_u64().unwrap_or(0)
+            );
         }
     }
     Ok(())

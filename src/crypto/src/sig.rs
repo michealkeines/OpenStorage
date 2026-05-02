@@ -16,6 +16,13 @@ pub fn generate_keypair<R: RngCore + CryptoRng>(rng: &mut R) -> (Ed25519Priv, Ed
     (Ed25519Priv(secret), Ed25519Pub(pk_bytes))
 }
 
+/// Derive the public Ed25519 key from a private key.
+pub fn ed25519_pub_from_priv(priv_key: &Ed25519Priv) -> Ed25519Pub {
+    let sk = SigningKey::from_bytes(&priv_key.0);
+    let pk: VerifyingKey = sk.verifying_key();
+    Ed25519Pub(pk.to_bytes())
+}
+
 pub fn sign(priv_key: &Ed25519Priv, message: &[u8]) -> Ed25519Sig {
     let sk = SigningKey::from_bytes(&priv_key.0);
     let sig: Signature = sk.sign(message);

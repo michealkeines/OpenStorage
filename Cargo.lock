@@ -1479,6 +1479,7 @@ dependencies = [
  "os-plugin-zeroxst",
  "os-recovery",
  "os-repair",
+ "os-share",
  "os-sync",
  "os-types",
  "os-vault",
@@ -1513,6 +1514,7 @@ dependencies = [
  "os-plugin-host",
  "os-recovery",
  "os-repair",
+ "os-share",
  "os-sync",
  "os-types",
  "os-vault",
@@ -1937,14 +1939,24 @@ dependencies = [
 name = "os-share"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "os-crypto",
  "os-entities",
  "os-events",
  "os-identity",
  "os-metadata",
+ "os-plugin-host",
+ "os-sync",
  "os-types",
+ "os-vault",
+ "os-vfs",
  "os-wal",
+ "rand 0.8.6",
+ "serde",
+ "serde_bytes",
  "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

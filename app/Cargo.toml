@@ -41,6 +41,7 @@ os-lease = { workspace = true }
 os-repair = { workspace = true }
 os-events = { workspace = true }
 os-entities = { workspace = true }
+os-share = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 axum = { workspace = true }

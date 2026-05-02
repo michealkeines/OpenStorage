@@ -238,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lease = Arc::new(os_lease::LeaseService::new());
     let repair = Arc::new(os_repair::RepairScheduler::new(4096));
     let events = Arc::new(os_events::EventBus::new());
+    let share = Arc::new(os_share::ShareService::new(store.clone(), vfs.clone()));
 
     // Repair worker: drains the scheduler. Currently handles GcSweep tasks
     // by deleting shards through their plugins and removing chunk/shard
@@ -348,6 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         repair,
         events,
         host,
+        share,
         device_id,
         fault: fault_any,
         plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
