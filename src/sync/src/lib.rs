@@ -254,6 +254,8 @@ impl SyncEngine {
                             cached_elsewhere_risk: CachedElsewhereRisk::Low,
                             counts_against_quota: true,
                             tombstone_clears_at: None,
+                            state: os_entities::ShadowState::Registered,
+                            peek_count: 0,
                         };
                         let mut txn = Txn::new();
                         store.put_shadow(&mut txn, &shadow)?;

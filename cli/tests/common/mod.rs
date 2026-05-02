@@ -30,9 +30,61 @@ pub struct Engine {
     _shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+/// F-MD-1..5 — pair of engines that share a single LocalDirPlugin
+/// directory as their vault provider. Each engine has its own metadata
+/// store, WAL, and device id, but writes go through the same on-disk
+/// `name:lease/<vault>` and `name:wal/<device>/<seq>` slots so
+/// cross-device coordination is observable.
+pub struct EnginePair {
+    pub a: Engine,
+    pub b: Engine,
+    pub provider_id: os_types::ProviderId,
+    pub shared_dir: PathBuf,
+}
+
+#[allow(dead_code)]
+pub async fn spawn_engine_pair() -> EnginePair {
+    let mut shared = std::env::temp_dir();
+    shared.push(format!("os-cli-md-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&shared).unwrap();
+    let provider_id = os_types::ProviderId::new_v7();
+    let a = spawn_engine_with_shared_provider(provider_id, shared.clone()).await;
+    let b = spawn_engine_with_shared_provider(provider_id, shared.clone()).await;
+    EnginePair {
+        a,
+        b,
+        provider_id,
+        shared_dir: shared,
+    }
+}
+
+#[allow(dead_code)]
+pub async fn spawn_engine_with_shared_provider(
+    provider_id: os_types::ProviderId,
+    shared_dir: PathBuf,
+) -> Engine {
+    spawn_engine_inner(Some((provider_id, shared_dir))).await
+}
+
 pub async fn spawn_engine() -> Engine {
+    spawn_engine_inner(None).await
+}
+
+async fn spawn_engine_inner(
+    shared_provider: Option<(os_types::ProviderId, PathBuf)>,
+) -> Engine {
     let store = Arc::new(Store::new(Arc::new(MemoryBackend::new())));
     let host = Arc::new(Host::new());
+    if let Some((pid, dir)) = &shared_provider {
+        let plugin = Arc::new(
+            os_plugin_host::LocalDirPlugin::new(dir.clone()).expect("local dir plugin"),
+        );
+        // Register as both chunk and vault role: F-MD-* needs vault-role
+        // (cas_write/named_get) and the rest of the harness still expects
+        // chunk-role for writes through the file API.
+        host.register_chunk(*pid, plugin.clone());
+        host.register_vault(*pid, plugin);
+    }
     let identity = Arc::new(IdentityService::new(store.clone()));
     let vault = Arc::new(VaultManager::new(store.clone(), host.clone()));
     let mut tdir = std::env::temp_dir();
@@ -78,6 +130,7 @@ pub async fn spawn_engine() -> Engine {
         device_id,
         fault: None,
         plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        plugin_decisions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

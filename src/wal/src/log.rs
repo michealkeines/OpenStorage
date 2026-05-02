@@ -37,7 +37,11 @@ pub struct Wal {
 struct WalInner {
     file: File,
     next_seq: u64,
-    /// Cached (offset, len) for each entry by seq.
+    /// Lowest retained seq. After `truncate_through(cutoff)` this advances to
+    /// `cutoff` and entries < cutoff are gone from disk.
+    min_seq: u64,
+    /// Cached (offset, len) for each retained entry. `index[i]` corresponds
+    /// to seq `min_seq + i`.
     index: Vec<EntrySlot>,
 }
 
@@ -89,6 +93,7 @@ impl WalBuilder {
             inner: Mutex::new(WalInner {
                 file,
                 next_seq: 0,
+                min_seq: 0,
                 index: Vec::new(),
             }),
         };
@@ -115,6 +120,10 @@ impl Wal {
     }
     pub fn next_seq(&self) -> u64 {
         self.inner.lock().expect("wal mutex").next_seq
+    }
+    /// Lowest seq still retained on disk. Advances after `truncate_through`.
+    pub fn min_seq(&self) -> u64 {
+        self.inner.lock().expect("wal mutex").min_seq
     }
 
     /// Append an op. Returns the resulting entry.
@@ -180,10 +189,11 @@ impl Wal {
     /// Read an entry by seq (originating-device-local).
     pub fn read(&self, seq: u64) -> Result<WalEntry> {
         let mut inner = self.inner.lock().expect("wal mutex");
-        let slot = *inner
-            .index
-            .get(seq as usize)
-            .ok_or(WalError::NotFound(seq))?;
+        if seq < inner.min_seq {
+            return Err(WalError::NotFound(seq));
+        }
+        let idx = (seq - inner.min_seq) as usize;
+        let slot = *inner.index.get(idx).ok_or(WalError::NotFound(seq))?;
         let mut buf = vec![0u8; slot.len as usize];
         inner
             .file
@@ -209,7 +219,75 @@ impl Wal {
         Ok(out)
     }
 
+    /// Drop entries with `seq < cutoff` from disk. Used after a snapshot
+    /// rotation: once a seq is contained in a durable snapshot, the WAL
+    /// no longer needs to retain it. Idempotent for `cutoff <= min_seq`.
+    pub fn truncate_through(&self, cutoff: u64) -> Result<()> {
+        let mut inner = self.inner.lock().expect("wal mutex");
+        if cutoff <= inner.min_seq {
+            return Ok(());
+        }
+        if cutoff > inner.next_seq {
+            return Err(WalError::NotFound(cutoff));
+        }
+        // Read retained bodies into memory, then rewrite the file.
+        let keep_from_idx = (cutoff - inner.min_seq) as usize;
+        let kept_slots: Vec<EntrySlot> = inner.index[keep_from_idx..].to_vec();
+        let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(kept_slots.len());
+        for slot in kept_slots {
+            inner
+                .file
+                .seek(SeekFrom::Start(slot.offset + FRAME_LEN_BYTES as u64))
+                .map_err(|e| WalError::Io(e.to_string()))?;
+            let mut body = vec![0u8; slot.len as usize];
+            inner
+                .file
+                .read_exact(&mut body)
+                .map_err(|e| WalError::Io(e.to_string()))?;
+            bodies.push(body);
+        }
+        // Truncate to zero and rewrite.
+        inner
+            .file
+            .set_len(0)
+            .map_err(|e| WalError::Io(e.to_string()))?;
+        inner
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| WalError::Io(e.to_string()))?;
+        let mut new_index: Vec<EntrySlot> = Vec::with_capacity(bodies.len());
+        let mut pos = 0u64;
+        for body in &bodies {
+            let len = body.len() as u32;
+            let crc = crc32(body);
+            inner
+                .file
+                .write_all(&len.to_be_bytes())
+                .map_err(|e| WalError::Io(e.to_string()))?;
+            inner
+                .file
+                .write_all(body)
+                .map_err(|e| WalError::Io(e.to_string()))?;
+            inner
+                .file
+                .write_all(&crc.to_be_bytes())
+                .map_err(|e| WalError::Io(e.to_string()))?;
+            new_index.push(EntrySlot { offset: pos, len });
+            pos += FRAME_LEN_BYTES as u64 + len as u64 + FRAME_CRC_BYTES as u64;
+        }
+        inner
+            .file
+            .sync_data()
+            .map_err(|e| WalError::Io(e.to_string()))?;
+        inner.index = new_index;
+        inner.min_seq = cutoff;
+        Ok(())
+    }
+
     /// Recover index from on-disk frames. Truncates a partial trailing entry.
+    /// If entries exist on disk, the first entry's `wal_id.seq` is taken
+    /// as `min_seq` (allowing post-truncate recovery to keep the original
+    /// seq numbering rather than restarting at zero).
     fn recover(&mut self) -> Result<()> {
         let mut inner = self.inner.lock().expect("wal mutex");
         let len = inner
@@ -270,7 +348,30 @@ impl Wal {
             .file
             .seek(SeekFrom::End(0))
             .map_err(|e| WalError::Io(e.to_string()))?;
-        inner.next_seq = index.len() as u64;
+        // Read the first surviving entry to recover min_seq (in case the WAL
+        // was previously truncated). Falls back to 0 if the log is empty.
+        let min_seq = if let Some(first) = index.first() {
+            inner
+                .file
+                .seek(SeekFrom::Start(first.offset + FRAME_LEN_BYTES as u64))
+                .map_err(|e| WalError::Io(e.to_string()))?;
+            let mut body = vec![0u8; first.len as usize];
+            inner
+                .file
+                .read_exact(&mut body)
+                .map_err(|e| WalError::Io(e.to_string()))?;
+            let entry: WalEntry = ciborium::from_reader(&body[..])
+                .map_err(|e| WalError::Serde(e.to_string()))?;
+            entry.wal_id.seq
+        } else {
+            0
+        };
+        inner
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| WalError::Io(e.to_string()))?;
+        inner.min_seq = min_seq;
+        inner.next_seq = min_seq + index.len() as u64;
         inner.index = index;
         Ok(())
     }

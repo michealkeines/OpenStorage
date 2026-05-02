@@ -99,6 +99,12 @@ pub trait VaultPluginContract: PluginContract {
         payload: &[u8],
         expected_etag: Option<BlakeHash>,
     ) -> Result<CasResult>;
+
+    /// Fetch a named blob's contents and current etag. Returns `Ok(None)`
+    /// for not-found, distinct from a transport error. Used by the
+    /// CAS-backed lease (F-MD-4) and similar small-blob coordination
+    /// records.
+    async fn named_get(&self, name: &str) -> Result<Option<(Vec<u8>, BlakeHash)>>;
 }
 
 #[derive(Debug, Clone)]

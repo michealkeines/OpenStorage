@@ -297,6 +297,47 @@ impl VaultPluginContract for HttpBackendPlugin {
             Err(e) => Err(e),
         }
     }
+
+    async fn named_get(
+        &self,
+        name: &str,
+    ) -> PluginResult<Option<(Vec<u8>, BlakeHash)>> {
+        let url = self.url(&format!("/v1/named/{}", urlencode(name)));
+        let resp = self
+            .http
+            .execute(os_plugin_host::http::HttpRequest {
+                method: reqwest::Method::GET,
+                url,
+                headers: reqwest::header::HeaderMap::new(),
+                body: None,
+            })
+            .await;
+        match resp {
+            Ok(r) => {
+                // Prefer the server's ETag header — different backends
+                // use different hash families (testbench: BLAKE2b-256;
+                // LocalDirPlugin: BLAKE3-32) so a client-side recompute
+                // would mismatch on the next CAS call.
+                let etag_hex = r.header_str("etag").map(|s| s.to_string());
+                let bytes = r.body.to_vec();
+                let etag = match etag_hex
+                    .as_ref()
+                    .and_then(|s| hex::decode(s.as_str()).ok())
+                {
+                    Some(v) if v.len() == 32 => {
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&v);
+                        BlakeHash::from_bytes(a)
+                    }
+                    _ => BlakeHash::from_bytes(*blake3::hash(&bytes).as_bytes()),
+                };
+                Ok(Some((bytes, etag)))
+            }
+            Err(PluginError::NotFound(_)) => Ok(None),
+            Err(PluginError::Plugin(m)) if m.contains("404") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 fn urlencode(s: &str) -> String {

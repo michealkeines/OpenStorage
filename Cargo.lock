@@ -1837,6 +1837,7 @@ name = "os-plugin-http-backend"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "hex",
  "os-entities",
  "os-plugin-host",

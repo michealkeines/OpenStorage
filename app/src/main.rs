@@ -363,6 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         device_id,
         fault: fault_any,
         plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        plugin_decisions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     tracing::info!(

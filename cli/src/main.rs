@@ -314,6 +314,16 @@ enum PluginsCmd {
         #[arg(long, value_delimiter = ',')]
         granted: Vec<String>,
     },
+    /// F-PL-3 — show whether a plugin is awaiting a user decision.
+    DecisionShow {
+        plugin_id: String,
+    },
+    /// F-PL-3 — clear an `AwaitingUserDecision` state. action ∈ keep|migrate_out.
+    Decide {
+        plugin_id: String,
+        #[arg(long)]
+        action: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -343,7 +353,14 @@ enum RecoveryCmd {
 #[derive(Subcommand, Debug)]
 enum LeaseCmd {
     Show,
-    Acquire,
+    Acquire {
+        /// Override "now" (seconds since unix epoch) — used by deterministic
+        /// multi-device tests; production callers omit it.
+        #[arg(long)]
+        now_epoch_secs: Option<u64>,
+        #[arg(long, default_value_t = 30)]
+        ttl_secs: u64,
+    },
     Renew,
     Release,
     /// CAS-overwrite a stale lease (F-MD-4). The TTL must be the value the
@@ -352,12 +369,22 @@ enum LeaseCmd {
     Steal {
         #[arg(long, default_value_t = 30)]
         ttl_secs: u64,
+        #[arg(long)]
+        now_epoch_secs: Option<u64>,
+        #[arg(long)]
+        expires_at_epoch_secs: Option<u64>,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum WalCmd {
     Show,
+    /// F-MD-5 — push our local WAL entries to the vault provider so peer
+    /// devices can replay them.
+    Push,
+    /// F-MD-5 — fetch every peer device's WAL entries from the vault
+    /// provider and apply them via the CRDT merge logic.
+    Pull,
 }
 
 #[derive(Subcommand, Debug)]
@@ -393,6 +420,10 @@ enum PeersCmd {
 #[derive(Subcommand, Debug)]
 enum ShadowsCmd {
     Ls,
+    /// F-HM-5 / shadow state machine — peek every Registered shadow against
+    /// its provider; not_found ⇒ Cleared (deleted), persistent exists past
+    /// the threshold ⇒ Permanent.
+    Sweep,
 }
 
 #[derive(Subcommand, Debug)]
@@ -420,6 +451,15 @@ enum RepairCmd {
         #[arg(long, default_value = "scrub")]
         source: String,
     },
+    /// F-HM-1/2/5 — drain up to `--max-tasks` from the queue and run them.
+    /// Tasks that fail are retried (up to MAX_ATTEMPTS=3) and then moved
+    /// to the `failed` list (RepairTask::Failed).
+    Run {
+        #[arg(long, default_value_t = 64)]
+        max_tasks: usize,
+    },
+    /// F-HM-3 — run an anti-entropy reconcile pass.
+    AntiEntropy,
 }
 
 #[derive(Subcommand, Debug)]
@@ -434,6 +474,10 @@ enum SharesCmd {
         /// Path scope (`*` for whole vault).
         #[arg(long)]
         scope: String,
+        /// Optional expiry in seconds-from-now. Past this, the share is
+        /// reported as `expired` and accept() refuses it.
+        #[arg(long)]
+        expires_in_secs: Option<u64>,
     },
     /// Accept a share previously created. Reads `--blob-hex` and
     /// `--owner-pub-hex` from the create command's output.
@@ -1129,8 +1173,12 @@ async fn lease_cmd(client: &reqwest::Client, base: &str, cmd: LeaseCmd) -> Resul
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
-        LeaseCmd::Acquire => {
-            let resp = client.post(&url_base).send().await?;
+        LeaseCmd::Acquire { now_epoch_secs, ttl_secs } => {
+            let mut body = serde_json::json!({"ttl_secs": ttl_secs});
+            if let Some(n) = now_epoch_secs {
+                body["now_epoch_secs"] = serde_json::json!(n);
+            }
+            let resp = client.post(&url_base).json(&body).send().await?;
             if !resp.status().is_success() {
                 let s = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -1158,10 +1206,17 @@ async fn lease_cmd(client: &reqwest::Client, base: &str, cmd: LeaseCmd) -> Resul
             }
             println!("✓ lease released");
         }
-        LeaseCmd::Steal { ttl_secs } => {
+        LeaseCmd::Steal { ttl_secs, now_epoch_secs, expires_at_epoch_secs } => {
+            let mut body = serde_json::json!({"ttl_secs": ttl_secs});
+            if let Some(n) = now_epoch_secs {
+                body["now_epoch_secs"] = serde_json::json!(n);
+            }
+            if let Some(e) = expires_at_epoch_secs {
+                body["expires_at_epoch_secs"] = serde_json::json!(e);
+            }
             let resp = client
                 .post(format!("{url_base}/steal"))
-                .json(&serde_json::json!({"ttl_secs": ttl_secs}))
+                .json(&body)
                 .send()
                 .await?;
             if resp.status().as_u16() == 409 {
@@ -1185,6 +1240,32 @@ async fn wal_cmd(client: &reqwest::Client, base: &str, cmd: WalCmd) -> Result<()
     match cmd {
         WalCmd::Show => {
             let resp = client.get(format!("{base}/v1/vaults/{}/wal", st.vault_id)).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        WalCmd::Push => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/wal/push", st.vault_id))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("wal push failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        WalCmd::Pull => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/wal/pull", st.vault_id))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("wal pull failed: {s} {b}");
+            }
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
@@ -1320,6 +1401,21 @@ async fn shadows_cmd(client: &reqwest::Client, base: &str, cmd: ShadowsCmd) -> R
                 }
             }
         }
+        ShadowsCmd::Sweep => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/shadows/sweep", st.vault_id))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!(
+                "shadow sweep: peeked={} cleared={} permanent={} still_registered={} errors={}",
+                body["peeked"].as_u64().unwrap_or(0),
+                body["cleared"].as_u64().unwrap_or(0),
+                body["promoted_permanent"].as_u64().unwrap_or(0),
+                body["still_registered"].as_u64().unwrap_or(0),
+                body["errors"].as_u64().unwrap_or(0),
+            );
+        }
     }
     Ok(())
 }
@@ -1389,6 +1485,41 @@ async fn repair_cmd(client: &reqwest::Client, base: &str, cmd: RepairCmd) -> Res
             let body: serde_json::Value = resp.json().await?;
             println!("✓ enqueued; queue depth = {}", body["queue_depth"]);
         }
+        RepairCmd::Run { max_tasks } => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/repair/run", st.vault_id))
+                .json(&serde_json::json!({"max_tasks": max_tasks}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("repair run failed: {s} {body}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!(
+                "repair run: processed={} succeeded={} retried={} failed={} queue_depth={} failed_total={}",
+                body["processed"].as_u64().unwrap_or(0),
+                body["succeeded"].as_u64().unwrap_or(0),
+                body["retried"].as_u64().unwrap_or(0),
+                body["failed"].as_u64().unwrap_or(0),
+                body["queue_depth"].as_u64().unwrap_or(0),
+                body["failed_total"].as_u64().unwrap_or(0),
+            );
+        }
+        RepairCmd::AntiEntropy => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/antientropy/run", st.vault_id))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("antientropy failed: {s} {body}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
     }
     Ok(())
 }
@@ -1406,20 +1537,33 @@ async fn shares_cmd(client: &reqwest::Client, base: &str, cmd: SharesCmd) -> Res
                     println!("(no shares)");
                 } else {
                     for sh in arr {
-                        println!("- {} → {}  scope={}  revoked={}",
+                        let state = sh["state"].as_str().unwrap_or(
+                            if sh["revoked"].as_bool().unwrap_or(false) { "revoked" } else { "active" },
+                        );
+                        println!("- {} → {}  scope={}  state={}  revoked={}",
                             sh["share_id"].as_str().unwrap_or("?"),
                             sh["recipient"].as_str().unwrap_or("?"),
                             sh["scope"].as_str().unwrap_or("?"),
-                            sh["revoked"].as_bool().unwrap_or(false),
+                            state,
+                            state == "revoked",
                         );
                     }
                 }
             }
         }
-        SharesCmd::Create { recipient, scope } => {
+        SharesCmd::Create { recipient, scope, expires_in_secs } => {
+            let mut body = serde_json::json!({"recipient": recipient, "scope": scope});
+            if let Some(secs) = expires_in_secs {
+                let exp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    + secs;
+                body["expires_at"] = serde_json::Value::String(format!("epoch:{exp}"));
+            }
             let resp = client
                 .post(&url)
-                .json(&serde_json::json!({"recipient": recipient, "scope": scope}))
+                .json(&body)
                 .send()
                 .await?;
             if !resp.status().is_success() {
@@ -1591,6 +1735,28 @@ async fn plugins_cmd(client: &reqwest::Client, base: &str, cmd: PluginsCmd) -> R
             }
             let body: serde_json::Value = resp.json().await?;
             println!("✓ credentials wrapped: {}", serde_json::to_string_pretty(&body)?);
+        }
+        PluginsCmd::DecisionShow { plugin_id } => {
+            let resp = client
+                .get(format!("{base}/v1/plugins/{plugin_id}/decision"))
+                .send()
+                .await?;
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        PluginsCmd::Decide { plugin_id, action } => {
+            let resp = client
+                .post(format!("{base}/v1/plugins/{plugin_id}/decision"))
+                .json(&serde_json::json!({"action": action}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                bail!("decide failed: {s} {b}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
         }
     }
     Ok(())

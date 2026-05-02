@@ -64,6 +64,16 @@ impl LeaseService {
         self.registry.clone()
     }
 
+    /// Force-install a lease record into the local registry without
+    /// CAS semantics. Used by the vault-backed lease path in `os-api`
+    /// to mirror the lease_id chosen during a successful cas_write so
+    /// subsequent renew/release calls match. The previous record (if
+    /// any) is silently overwritten.
+    pub fn install_local(&self, record: LeaseRecord) {
+        *self.local.lock().expect("lease local") = Some(record.lease_id);
+        *self.registry.lock().expect("lease registry") = Some(record);
+    }
+
     pub fn state(&self) -> LeaseState {
         if self.registry.lock().expect("lease registry").is_some() {
             LeaseState::Held

@@ -48,7 +48,12 @@ impl LocalDirPlugin {
     }
 
     fn name_to_path(&self, name: &str) -> PathBuf {
-        self.root.join(format!("name:{name}"))
+        // Names may contain `/` (e.g. `lease/<vault>` or `wal/<dev>/<seq>`)
+        // which we don't want to interpret as filesystem path segments.
+        // Replace with a sentinel that's unlikely to appear in an
+        // identifier but trivially round-trippable.
+        let flat = name.replace('/', "%2F");
+        self.root.join(format!("name:{flat}"))
     }
 
     fn fresh_handle() -> NativeHandle {
@@ -182,7 +187,11 @@ impl VaultPluginContract for LocalDirPlugin {
         limit: u32,
         cursor: Option<Vec<u8>>,
     ) -> Result<(Vec<ListEntry>, Option<Vec<u8>>)> {
-        let prefix_full = format!("name:{prefix}");
+        // The on-disk name encoding flattens `/` ⇒ `%2F` (see
+        // `name_to_path`). Apply the same transform to the prefix so
+        // listings match nested-name slots like `wal/<dev>/<seq>`.
+        let flat_prefix = prefix.replace('/', "%2F");
+        let prefix_full = format!("name:{flat_prefix}");
         let mut entries = Vec::new();
         let start_cursor = cursor.and_then(|c| String::from_utf8(c).ok()).unwrap_or_default();
         let mut iter = std::fs::read_dir(&self.root).map_err(|e| PluginError::Io(e.to_string()))?;
@@ -198,7 +207,10 @@ impl VaultPluginContract for LocalDirPlugin {
         let next_cursor = None;
         for n in names.into_iter().filter(|n| n.as_str() > start_cursor.as_str()).take(limit as usize)
         {
-            let bare = n.strip_prefix("name:").unwrap_or(&n).to_string();
+            // Reverse the flattening so callers see the original logical
+            // name (e.g. `wal/<dev>/<seq>`).
+            let bare_flat = n.strip_prefix("name:").unwrap_or(&n).to_string();
+            let bare = bare_flat.replace("%2F", "/");
             let path = self.root.join(&n);
             let md = std::fs::metadata(&path).map_err(|e| PluginError::Io(e.to_string()))?;
             let bytes = std::fs::read(&path).map_err(|e| PluginError::Io(e.to_string()))?;
@@ -238,6 +250,19 @@ impl VaultPluginContract for LocalDirPlugin {
             outcome: CasOutcome::Written,
             new_etag: Some(Self::etag_of(payload)),
         })
+    }
+
+    async fn named_get(&self, name: &str) -> Result<Option<(Vec<u8>, BlakeHash)>> {
+        let _g = self.lock.lock().expect("plugin mutex");
+        let path = self.name_to_path(name);
+        match std::fs::read(&path) {
+            Ok(b) => {
+                let etag = Self::etag_of(&b);
+                Ok(Some((b, etag)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PluginError::Io(e.to_string())),
+        }
     }
 }
 

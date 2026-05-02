@@ -2,10 +2,10 @@
 
 _Drives every state machine documented in `STATES_AND_FLOWS.md` from the CLI._
 
-- Date: `2026-05-01 23:37:12 CEST`
-- Git: `33bd97b`
+- Date: `2026-05-02 15:51:29 CEST`
+- Git: `ca43bfd`
 - Engine 1: 127.0.0.1:7878 · Engine 2: 127.0.0.1:7879 · Testbench: 127.0.0.1:9090
-- Total checks: **65** · ✅ Passed: **50** · ⚠️  Pending: **15** · ❌ Failed: **0**
+- Total checks: **65** · ✅ Passed: **49** · ⚠️  Pending: **15** · ❌ Failed: **0**
 
 Legend:
 - ✅ **PASS** — state was actively reached and verified by the harness.
@@ -41,13 +41,13 @@ Legend:
 | Lease | AcquireConflict | double-acquire blocks | `os lease acquire (twice)` | ✅ PASS |  |
 | Lease | Stolen | another device CAS-writes after 2×TTL | `(multi-device)` | ⚠️ PENDING | engine LeaseService is in-memory; cas_write-backed lease across vault providers is the next step (F-MD-4) |
 | Plugin | Loaded | default at registration | `os plugin-state show` | ✅ PASS |  |
-| Plugin | init | transition: init | `os plugin-state set 019de579-6776-7a92-a014-d3081351c908 init` | ✅ PASS |  |
-| Plugin | ready | transition: ready | `os plugin-state set 019de579-6776-7a92-a014-d3081351c908 ready` | ✅ PASS |  |
-| Plugin | active | transition: activate | `os plugin-state set 019de579-6776-7a92-a014-d3081351c908 activate` | ✅ PASS |  |
-| Plugin | paused | transition: pause | `os plugin-state set 019de579-6776-7a92-a014-d3081351c908 pause` | ✅ PASS |  |
-| Plugin | active | transition: resume | `os plugin-state set 019de579-6776-7a92-a014-d3081351c908 resume` | ✅ PASS |  |
-| Plugin | disabled | transition: disable | `os plugin-state set 019de579-6776-7a92-a014-d3081351c908 disable` | ✅ PASS |  |
-| Plugin | closed | transition: close | `os plugin-state set 019de579-6776-7a92-a014-d3081351c908 close` | ✅ PASS |  |
+| Plugin | init | transition: init | `os plugin-state set 019de8f5-6665-7181-9308-8811cf37c90e init` | ✅ PASS |  |
+| Plugin | ready | transition: ready | `os plugin-state set 019de8f5-6665-7181-9308-8811cf37c90e ready` | ✅ PASS |  |
+| Plugin | active | transition: activate | `os plugin-state set 019de8f5-6665-7181-9308-8811cf37c90e activate` | ✅ PASS |  |
+| Plugin | paused | transition: pause | `os plugin-state set 019de8f5-6665-7181-9308-8811cf37c90e pause` | ✅ PASS |  |
+| Plugin | active | transition: resume | `os plugin-state set 019de8f5-6665-7181-9308-8811cf37c90e resume` | ✅ PASS |  |
+| Plugin | disabled | transition: disable | `os plugin-state set 019de8f5-6665-7181-9308-8811cf37c90e disable` | ✅ PASS |  |
+| Plugin | closed | transition: close | `os plugin-state set 019de8f5-6665-7181-9308-8811cf37c90e close` | ✅ PASS |  |
 | Plugin | AwaitingUserDecision | capability drift detected | `(F-PL-3)` | ⚠️ PENDING | manifest-diff path requires plugin install endpoint; tracked |
 | Plugin | Migrating | user chose migrate-out | `(F-PL-3)` | ⚠️ PENDING | depends on AwaitingUserDecision |
 | Shard | Healthy | after successful put + ack | `os upload` | ✅ PASS | two 4 MiB shards |
@@ -61,7 +61,7 @@ Legend:
 | Chunk | Lost | EC threshold breached | `(deterministic on EC(1,1) when shard fails)` | ✅ PASS | covered by 6.b path; vault provider unavailability surfaces immediately |
 | Shard | Free | refcount drops to 0 (after rm) | `os rm <name>` | ✅ PASS | delete marks file gone; shadows unchanged today (engine does not GC-sweep yet) |
 | Shadow | Registered | engine registers shadow on rm | `os rm <chunked-file>` | ✅ PASS | 3 shadow records visible after rm |
-| Shadow | Cleared | peek says not_found ⇒ shadow removed | `(shadow sweep)` | ✅ PASS | shadow count 3 → 0 |
+| Shadow | Cleared | peek says not_found | `(shadow sweep)` | 🟦 PARTIAL | shadow_sweep ran; backend may report exists=true on testbench (PUT-only objects) |
 | Shadow | Permanent | peek persistently exists | `(F-VL-4 residual report)` | ⚠️ PENDING | promotion to Permanent after N persistent peeks not yet implemented |
 | WalEntry | InMemory | between append and fsync | `(internal state; not separately observable)` | ✅ PASS | WAL.append calls fsync_data immediately; window is sub-millisecond |
 | WalEntry | LocalDurable | after fsync_data | `any os upload / os rm` | ✅ PASS | every CLI mutation appends a signed WAL entry that survives engine restart (verified by tc-018 in cli_flow_tests) |
@@ -71,7 +71,7 @@ Legend:
 | RepairTask | InFlight | worker drained queue | `(GC sweep worker)` | ✅ PASS | queue depth 1 → 0 |
 | RepairTask | Completed | worker success ⇒ depth drops | `(GC sweep worker)` | ✅ PASS |  |
 | RepairTask | Failed | N retries exhausted | `(no fault path yet)` | ⚠️ PENDING | retry-with-backoff loop not implemented in worker; tracked |
-| Share | Created | after share create | `os shares create --recipient X --scope *` | ✅ PASS | share_id=019de579-87a7-7ce1-a8b4-7e0a419067d4 |
+| Share | Created | after share create | `os shares create --recipient X --scope *` | ✅ PASS | share_id=019de8f5-8853-7290-a2dc-cc63c7fafea1 |
 | Share | Active | recipient accepts | `(F-SH-2)` | ⚠️ PENDING | accept-share endpoint pending; KEM placeholder limits real verification |
 | Share | Revoked | after share revoke | `os shares revoke <id>` | ✅ PASS |  |
 | Share | Expired | expires_at passes | `(time-based)` | ⚠️ PENDING | expires_at field in entity but no scheduler trims active set |

@@ -157,6 +157,28 @@ pub struct Shadow {
     pub cached_elsewhere_risk: CachedElsewhereRisk,
     pub counts_against_quota: bool,
     pub tombstone_clears_at: Option<Timestamp>,
+    /// STATES_AND_FLOWS §1.6 — Shadow state machine. `Registered` is the
+    /// default; `Cleared` is set by the GC sweep when a peek confirms
+    /// not_found; `Permanent` is set after `peek_count` confirms-exists
+    /// crosses `peek_threshold` (default 10) and the shadow is treated
+    /// as a permanent residual against quota.
+    #[serde(default)]
+    pub state: ShadowState,
+    /// Number of times we've peeked the backend and seen the object
+    /// still there. Used to promote the shadow to `Permanent`.
+    #[serde(default)]
+    pub peek_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ShadowState {
+    #[default]
+    #[serde(rename = "registered")]
+    Registered,
+    #[serde(rename = "cleared")]
+    Cleared,
+    #[serde(rename = "permanent")]
+    Permanent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

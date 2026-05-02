@@ -473,6 +473,25 @@ impl VfsService {
         let mut txn = Txn::new();
         self.store.put_file(&mut txn, &file)?;
         self.store.commit(txn)?;
+        // F-MD-5 — emit a tiny CRDT op to the WAL so peers can replay.
+        // We use the file's path as a stand-in for the whole write;
+        // sync::apply_remote_wal_segment already handles
+        // `LwwRegister(file.path)` (F-MD-3) on the receive side. Bigger
+        // entities like the chunked record graph are still skipped per
+        // the indirection note, but path is small and load-bearing.
+        let mut path_buf = Vec::new();
+        let _ = ciborium::into_writer(file.path.value.as_str(), &mut path_buf);
+        let _ = self.sync.apply_local_op(
+            Op::LwwRegister {
+                target: os_entities::Key::new(
+                    os_entities::KeyKind::File,
+                    file.file_id.as_uuid().as_bytes().to_vec(),
+                    "path",
+                ),
+                value: path_buf,
+            },
+            None,
+        );
         Ok(FileMeta {
             file_id: file.file_id,
             path: file.path.value,
@@ -865,6 +884,8 @@ impl VfsService {
                                 cached_elsewhere_risk: os_types::CachedElsewhereRisk::Low,
                                 counts_against_quota: true,
                                 tombstone_clears_at: None,
+                                state: os_entities::ShadowState::Registered,
+                                peek_count: 0,
                             };
                             self.store.put_shadow(&mut txn, &shadow)?;
                         }
@@ -912,10 +933,14 @@ impl VfsService {
     /// is owned by `repair/`.
     pub fn rotate_file_key(&self, file_id: FileId) -> Result<u64, VfsError> {
         let mk = self.vault.master_key().ok_or(VfsError::VaultLocked)?;
-        let mut file = self
-            .store
-            .get_file(file_id)?
-            .ok_or_else(|| VfsError::NotFound(file_id.to_string()))?;
+        // F-SH-3: vault- and folder-scope shares bind to a synthetic
+        // FileId with no backing record. Bump a virtual key version
+        // so revoke still completes (the wrapped_key OR-SET removal
+        // path is the load-bearing piece for `Share::Revoked`).
+        let mut file = match self.store.get_file(file_id)? {
+            Some(f) => f,
+            None => return Ok(1),
+        };
         let new_version = file.file_key_version + 1;
         if let Some(payload) = file.inline_payload.clone() {
             let old_key = derive_file_key(&mk, file_id, file.file_key_version)?;
@@ -952,11 +977,14 @@ impl VfsService {
     /// Read the current `file_key_version` for a file. Used by sharing to
     /// derive the file_key of a specific generation for KEM wrapping.
     pub fn file_key_version(&self, file_id: FileId) -> Result<u64, VfsError> {
-        let f = self
-            .store
-            .get_file(file_id)?
-            .ok_or_else(|| VfsError::NotFound(file_id.to_string()))?;
-        Ok(f.file_key_version)
+        // Vault- or folder-scope shares (F-SH-1) bind to a synthetic FileId
+        // that won't have a backing record. Treat a missing file as
+        // version 0 instead of refusing — the share blob still carries
+        // a valid signed envelope; per-file material lives elsewhere.
+        match self.store.get_file(file_id)? {
+            Some(f) => Ok(f.file_key_version),
+            None => Ok(0),
+        }
     }
 
     pub fn stat(&self, path: &str) -> Result<FileMeta, VfsError> {
@@ -1204,9 +1232,20 @@ async fn read_one_chunk(
                     "shard fetch failed; falling back"
                 );
                 errors.push(format!("{provider_id}: {e}"));
-                // F-HM-2 inline read repair: enqueue a HIGH-priority
-                // ReadRepair task. We continue to serve the read from
-                // the remaining shards; repair runs in background.
+                // F-HM-2 inline read repair: flip the affected shard's
+                // health to Degraded, then enqueue a HIGH-priority
+                // ReadRepair task. The read continues to be served from
+                // remaining shards; repair runs in background. Driving
+                // health from the read path is what lets `os repair show`
+                // surface degraded shards even before a scrub runs.
+                if let Some(s) = shards.iter().find(|s| s.driver_id.value == provider_id) {
+                    let mut updated = s.clone();
+                    updated.health_score = HealthScore::new(0.0);
+                    let mut txn = os_metadata::Txn::new();
+                    if store.put_shard(&mut txn, &updated).is_ok() {
+                        let _ = store.commit(txn);
+                    }
+                }
                 if let Some(r) = &repair {
                     let _ = r.enqueue(RepairTask {
                         chunk_hash,

@@ -70,8 +70,23 @@ impl Ord for RepairTask {
 
 pub struct RepairScheduler {
     queue: Mutex<BinaryHeap<RepairTask>>,
+    /// STATES_AND_FLOWS §1.9 — terminal-state list. Tasks land here after
+    /// `MAX_ATTEMPTS` retries; surfaced via the queue-state endpoint so the
+    /// caller can inspect why a chunk could not be repaired.
+    failed: Mutex<Vec<FailedTask>>,
     max_size: usize,
 }
+
+/// A task that exhausted its retry budget. The original task plus the
+/// last error string is kept for observability.
+#[derive(Debug, Clone)]
+pub struct FailedTask {
+    pub task: RepairTask,
+    pub last_error: String,
+}
+
+/// Hard cap on retry attempts before a task is moved to `failed`.
+pub const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct QueueState {
@@ -83,8 +98,44 @@ impl RepairScheduler {
     pub fn new(max_size: usize) -> Self {
         Self {
             queue: Mutex::new(BinaryHeap::new()),
+            failed: Mutex::new(Vec::new()),
             max_size,
         }
+    }
+
+    /// Re-queue a task that hit a transient error. If the next attempt
+    /// would exceed `MAX_ATTEMPTS`, the task is moved to the `failed`
+    /// list instead. STATES_AND_FLOWS §1.9 — this is the
+    /// `Re-enqueued (with backoff)` ↔ `Failed` transition.
+    pub fn record_attempt_failure(&self, mut task: RepairTask, error: String) {
+        task.attempt += 1;
+        if task.attempt >= MAX_ATTEMPTS {
+            self.failed
+                .lock()
+                .expect("repair failed mutex")
+                .push(FailedTask {
+                    task,
+                    last_error: error,
+                });
+        } else {
+            // Lower priority slightly per attempt so fresh tasks drain
+            // first; ties still respect the original priority.
+            task.priority = task.priority.saturating_sub(1);
+            let _ = self.enqueue(task);
+        }
+    }
+
+    /// Return a snapshot of `failed` and clear it. Callers report this
+    /// in `/repair` and surface it for human review.
+    pub fn drain_failed(&self) -> Vec<FailedTask> {
+        let mut g = self.failed.lock().expect("repair failed mutex");
+        let out = g.clone();
+        g.clear();
+        out
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failed.lock().expect("repair failed mutex").len()
     }
 
     pub fn enqueue(&self, task: RepairTask) -> Result<(), RepairError> {
