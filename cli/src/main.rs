@@ -88,6 +88,27 @@ enum Cmd {
         /// Remote name.
         name: String,
     },
+    /// Rename / move a file in the active vault.
+    Mv {
+        /// Source name.
+        src: String,
+        /// Destination name.
+        dst: String,
+    },
+    /// Patch a byte range of an existing file (PATCH with Content-Range).
+    Patch {
+        /// Remote name.
+        name: String,
+        /// Local file holding the replacement bytes.
+        from: PathBuf,
+        /// Start byte offset (inclusive).
+        #[arg(long)]
+        start: u64,
+        /// Total file size after patch (defaults to current size or
+        /// `start + body_len`, whichever is larger).
+        #[arg(long)]
+        total: Option<u64>,
+    },
     /// Destroy the active vault (requires --confirm).
     Destroy {
         /// Type the vault id to confirm.
@@ -353,9 +374,15 @@ struct State {
 
 impl State {
     fn path() -> Result<PathBuf> {
-        let dir = dirs::config_dir()
-            .ok_or_else(|| anyhow!("could not resolve config directory"))?
-            .join("openstorage");
+        // `$OPENSTORAGE_STATE_DIR` lets integration tests pin per-test state
+        // without polluting the user's real config directory.
+        let dir = if let Ok(p) = std::env::var("OPENSTORAGE_STATE_DIR") {
+            PathBuf::from(p)
+        } else {
+            dirs::config_dir()
+                .ok_or_else(|| anyhow!("could not resolve config directory"))?
+                .join("openstorage")
+        };
         std::fs::create_dir_all(&dir)?;
         Ok(dir.join("state.json"))
     }
@@ -404,6 +431,10 @@ async fn main() -> Result<()> {
         Cmd::Ls { prefix } => ls(&client, &cli.base, &prefix).await,
         Cmd::Stat { name } => stat(&client, &cli.base, &name).await,
         Cmd::Rm { name } => rm(&client, &cli.base, &name).await,
+        Cmd::Mv { src, dst } => mv(&client, &cli.base, &src, &dst).await,
+        Cmd::Patch { name, from, start, total } => {
+            patch(&client, &cli.base, &name, &from, start, total).await
+        }
         Cmd::Destroy { confirm } => destroy(&client, &cli.base, &confirm).await,
         Cmd::RotateMk { new_passphrase } => rotate_mk(&client, &cli.base, &new_passphrase).await,
         Cmd::Identity { cmd } => identity_cmd(&client, &cli.base, cmd).await,
@@ -728,6 +759,79 @@ async fn rm(client: &reqwest::Client, base: &str, name: &str) -> Result<()> {
         bail!("delete failed: {}", resp.status());
     }
     println!("✓ deleted {name}");
+    Ok(())
+}
+
+async fn mv(client: &reqwest::Client, base: &str, src: &str, dst: &str) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault — run `os init` first"))?;
+    ensure_unlocked(client, base, &st).await?;
+    let src_remote = if src.starts_with('/') { src.to_string() } else { format!("/{src}") };
+    let dst_remote = if dst.starts_with('/') { dst.to_string() } else { format!("/{dst}") };
+    let url = format!("{base}/v1/vaults/{}/files{src_remote}/move", st.vault_id);
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "to": dst_remote }))
+        .send()
+        .await?;
+    if resp.status().as_u16() == 404 {
+        bail!("not found: {src}");
+    }
+    if !resp.status().is_success() {
+        bail!("rename failed: {}", resp.status());
+    }
+    println!("✓ {src} → {dst}");
+    Ok(())
+}
+
+async fn patch(
+    client: &reqwest::Client,
+    base: &str,
+    name: &str,
+    from: &Path,
+    start: u64,
+    total_override: Option<u64>,
+) -> Result<()> {
+    let st = State::load()?.ok_or_else(|| anyhow!("no saved vault — run `os init` first"))?;
+    ensure_unlocked(client, base, &st).await?;
+    let body = std::fs::read(from).with_context(|| format!("read {}", from.display()))?;
+    if body.is_empty() {
+        bail!("body must be non-empty");
+    }
+    let end = start + body.len() as u64 - 1;
+    // Discover current size via HEAD if total not provided.
+    let remote = if name.starts_with('/') { name.to_string() } else { format!("/{name}") };
+    let total = match total_override {
+        Some(t) => t,
+        None => {
+            let head_url = format!("{base}/v1/vaults/{}/files{remote}", st.vault_id);
+            let r = client.head(&head_url).send().await?;
+            if !r.status().is_success() {
+                bail!("HEAD {name} failed: {}", r.status());
+            }
+            let cur = r
+                .headers()
+                .get("x-size-bytes")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            cur.max(end + 1)
+        }
+    };
+    let url = format!("{base}/v1/vaults/{}/files{remote}", st.vault_id);
+    let cr = format!("bytes {start}-{end}/{total}");
+    let resp = client
+        .patch(&url)
+        .header("content-range", cr)
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("patch failed: {s} {body}");
+    }
+    println!("✓ patched {name} [{start}..={end}] of {total}");
     Ok(())
 }
 

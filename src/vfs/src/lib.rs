@@ -247,7 +247,9 @@ impl VfsService {
 
         // Chunked path. We've already read the first chunk's worth of bytes
         // into `head`; treat that as the start of the stream.
-        let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(path.as_bytes()))?;
+        // Per F-FL-5 the file_key is bound to the stable `file_id`, not to
+        // the path (which is a mutable LWW field).
+        let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(file_id.as_uuid().as_bytes()))?;
         let vault_salt: Option<Vec<u8>> = self
             .vault
             .vault_id()
@@ -402,8 +404,8 @@ impl VfsService {
         now: &Timestamp,
         existing: Option<File>,
     ) -> Result<FileMeta, VfsError> {
-        let file_key = derive_subkey(mk, KeyPurpose::FILE, Some(path.as_bytes()))?;
-        let aad = inline_aad(file_id, path);
+        let file_key = derive_subkey(mk, KeyPurpose::FILE, Some(file_id.as_uuid().as_bytes()))?;
+        let aad = inline_aad(file_id);
         let nonce = random_nonce_12();
         let (ct, tag) = aead_encrypt(self.cfg.aead_suite, &file_key, &nonce, bytes, &aad)?;
         let hlc = next_hlc(&self.sync);
@@ -742,8 +744,8 @@ impl VfsService {
 
         // Inline → single-shot stream.
         if let Some(payload) = file.inline_payload.clone() {
-            let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(path_owned.as_bytes()))?;
-            let aad = inline_aad(file.file_id, &path_owned);
+            let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(file.file_id.as_uuid().as_bytes()))?;
+            let aad = inline_aad(file.file_id);
             let pt = aead_decrypt(
                 self.cfg.aead_suite,
                 &file_key,
@@ -762,7 +764,7 @@ impl VfsService {
         let cfg = self.cfg;
         let store = self.store.clone();
         let plugin_host = self.plugin_host.clone();
-        let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(path_owned.as_bytes()))?;
+        let file_key = derive_subkey(&mk, KeyPurpose::FILE, Some(file.file_id.as_uuid().as_bytes()))?;
         let fetch_concurrency = cfg.chunk_fetch_concurrency.max(1);
         let read_hedge = cfg.read_hedge as usize;
         let stream = async_stream::try_stream! {
@@ -845,10 +847,41 @@ impl VfsService {
         Ok(())
     }
 
+    /// F-FL-5: rename/move. Resolves `src` → FILE record by stable `file_id`,
+    /// then writes `LwwRegister(file.path, dst)`. No tree mutation; the `path`
+    /// field is a regular LWW field (DESIGN §5.8). Directory listings update
+    /// implicitly via prefix projection (DESIGN §6.13).
+    pub fn rename(&self, src: &str, dst: &str) -> Result<FileMeta, VfsError> {
+        let _mk = self.vault.master_key().ok_or(VfsError::VaultLocked)?;
+        let mut file = self
+            .find_by_path(src)?
+            .ok_or_else(|| VfsError::NotFound(src.into()))?;
+        if !file.exists.value {
+            return Err(VfsError::NotFound(src.into()));
+        }
+        let device = self.sync.wal().device_id();
+        let hlc = next_hlc(&self.sync);
+        file.path = LwwRegister::new(dst.to_string(), hlc, device);
+        let mut txn = Txn::new();
+        self.store.put_file(&mut txn, &file)?;
+        self.store.commit(txn)?;
+        Ok(FileMeta {
+            file_id: file.file_id,
+            path: file.path.value,
+            size_bytes: file.size_bytes.value,
+            modified_at: file.modified_at.value,
+            content_type: file.content_type.value,
+            exists: file.exists.value,
+        })
+    }
+
     pub fn stat(&self, path: &str) -> Result<FileMeta, VfsError> {
         let f = self
             .find_by_path(path)?
             .ok_or_else(|| VfsError::NotFound(path.into()))?;
+        if !f.exists.value {
+            return Err(VfsError::NotFound(path.into()));
+        }
         Ok(FileMeta {
             file_id: f.file_id,
             path: f.path.value,
@@ -1089,11 +1122,13 @@ fn group_lookup(
     out
 }
 
-fn inline_aad(file_id: FileId, path: &str) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8 + 16 + path.len());
+/// AAD for inline file payloads. Bound to the stable `file_id` only — the
+/// path is an LWW field that can change via F-FL-5 (rename) without
+/// re-encryption, so it must not be part of the ciphertext binding.
+fn inline_aad(file_id: FileId) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 16);
     v.extend_from_slice(b"inline:");
     v.extend_from_slice(file_id.as_uuid().as_bytes());
-    v.extend_from_slice(path.as_bytes());
     v
 }
 
@@ -1220,6 +1255,53 @@ mod tests {
         let got = svc.read("/big").await.unwrap();
         assert_eq!(got.len(), payload.len());
         assert_eq!(got, payload);
+    }
+
+    /// F-FL-5 — rename moves a file's path and the old path no longer
+    /// resolves; the file_id stays stable; content is preserved.
+    #[tokio::test]
+    async fn rename_inline_file() {
+        let (svc, _pid, _) = fixture_with_local_plugin();
+        let original = svc.write("/old.txt", b"hello").await.unwrap();
+        let renamed = svc.rename("/old.txt", "/new.txt").unwrap();
+        assert_eq!(renamed.file_id, original.file_id);
+        assert_eq!(renamed.path, "/new.txt");
+        assert!(matches!(svc.stat("/old.txt"), Err(VfsError::NotFound(_))));
+        let got = svc.read("/new.txt").await.unwrap();
+        assert_eq!(got, b"hello");
+    }
+
+    /// F-FL-5 — chunked file rename preserves chunk_list; content readable.
+    #[tokio::test]
+    async fn rename_chunked_file() {
+        let (svc, _pid, _) = fixture_with_local_plugin();
+        let payload = vec![3u8; 200 * 1024];
+        let original = svc.write("/big-old", &payload).await.unwrap();
+        let renamed = svc.rename("/big-old", "/big-new").unwrap();
+        assert_eq!(renamed.file_id, original.file_id);
+        assert!(matches!(svc.stat("/big-old"), Err(VfsError::NotFound(_))));
+        let got = svc.read("/big-new").await.unwrap();
+        assert_eq!(got, payload);
+    }
+
+    /// F-FL-5 — listing with the destination prefix surfaces the renamed
+    /// file; listing with the source prefix does not.
+    #[tokio::test]
+    async fn rename_updates_prefix_listing() {
+        let (svc, _pid, _) = fixture_with_local_plugin();
+        svc.write("/inbox/a.txt", b"a").await.unwrap();
+        svc.rename("/inbox/a.txt", "/archive/a.txt").unwrap();
+        let inbox = svc.list("/inbox/").unwrap();
+        assert!(inbox.iter().all(|f| f.path != "/inbox/a.txt"));
+        let archive = svc.list("/archive/").unwrap();
+        assert!(archive.iter().any(|f| f.path == "/archive/a.txt"));
+    }
+
+    /// F-FL-5 — renaming a missing path returns NotFound.
+    #[tokio::test]
+    async fn rename_missing_returns_not_found() {
+        let (svc, _pid, _) = fixture_with_local_plugin();
+        assert!(matches!(svc.rename("/missing", "/wherever"), Err(VfsError::NotFound(_))));
     }
 
     #[tokio::test]

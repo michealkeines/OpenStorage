@@ -502,4 +502,66 @@ mod tests {
         let err = svc.unlock(v.vault_id, b"bad");
         assert!(matches!(err, Err(RecoveryError::Unauthenticated)));
     }
+
+    /// F-VL-2 — explicit unlock-after-lock cycle: state lands on Unlocked.
+    #[test]
+    fn unlock_after_lock_restores_unlocked_state() {
+        let svc = fixtures();
+        let (v, _m) = svc.new_vault(b"alpha").unwrap();
+        assert_eq!(svc.vault.state(), os_vault::VaultState::Unlocked);
+        svc.vault.lock().unwrap();
+        assert_eq!(svc.vault.state(), os_vault::VaultState::Locked);
+        svc.unlock(v.vault_id, b"alpha").unwrap();
+        assert_eq!(svc.vault.state(), os_vault::VaultState::Unlocked);
+    }
+
+    /// F-VL-5 — rotate MK: old passphrase no longer unlocks; new one does.
+    #[test]
+    fn rotate_master_key_invalidates_old_passphrase() {
+        let svc = fixtures();
+        let (v, _m) = svc.new_vault(b"old-pass").unwrap();
+        svc.rotate_master_key(v.vault_id, b"new-pass").unwrap();
+        svc.vault.lock().unwrap();
+        assert!(matches!(
+            svc.unlock(v.vault_id, b"old-pass"),
+            Err(RecoveryError::Unauthenticated)
+        ));
+        svc.unlock(v.vault_id, b"new-pass").unwrap();
+        assert_eq!(svc.vault.state(), os_vault::VaultState::Unlocked);
+    }
+
+    /// 6.A.4 — rotate recovery token: active-set replaces, version_counter bumps.
+    #[test]
+    fn rotate_recovery_token_updates_active_set() {
+        let svc = fixtures();
+        let (v, manifest) = svc.new_vault(b"pp").unwrap();
+        let initial_count = manifest.recovery_token_active_set.live_values().count();
+        let initial_version = manifest.version_counter.0;
+        let new_id = svc.rotate_recovery_token(v.vault_id).unwrap();
+        // Reload manifest.
+        let backend = svc.store.backend();
+        let bytes = backend
+            .get(os_metadata::ColumnFamily::VaultMeta, &manifest_key(v.vault_id))
+            .unwrap()
+            .unwrap();
+        let m2: RecoveryManifest = decode_cbor(&bytes).unwrap();
+        let live: Vec<RecoveryTokenId> =
+            m2.recovery_token_active_set.live_values().copied().collect();
+        assert_eq!(live, vec![new_id]);
+        assert!(m2.version_counter.0 > initial_version);
+        let _ = initial_count;
+    }
+
+    /// F-VL-4 — destroy_vault transitions to Destroyed and returns a
+    /// ResidualReport. The mock plugin host has no chunk plugins so the
+    /// sweep finds nothing to remove; the state transition is the contract.
+    #[tokio::test]
+    async fn destroy_vault_transitions_to_destroyed() {
+        let svc = fixtures();
+        let (v, _m) = svc.new_vault(b"x").unwrap();
+        let report = svc.destroy_vault(v.vault_id).await.unwrap();
+        assert_eq!(svc.vault.state(), os_vault::VaultState::Destroyed);
+        // Trivial pool: nothing to sweep, no failures expected.
+        assert_eq!(report.failed_shards, 0);
+    }
 }

@@ -20,3 +20,6 @@ serde = { workspace = true }
 ciborium = { workspace = true }
 os-vault = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

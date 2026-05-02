@@ -70,12 +70,19 @@ impl Store {
 
     // ─── File ──────────────────────────────────────────────────────────────
     pub fn put_file(&self, txn: &mut Txn, f: &File) -> Result<()> {
+        // If a prior version of this file_id exists at a different path,
+        // drop the stale PathIndex entry so renames don't leave dangling
+        // mappings that would let the old path resolve back to this record.
+        if let Some(prev) = self.get_file(f.file_id)? {
+            if prev.path.value != f.path.value {
+                txn.delete(
+                    ColumnFamily::PathIndex,
+                    prev.path.value.as_bytes().to_vec(),
+                );
+            }
+        }
         txn.put(ColumnFamily::Files, f.file_id.as_uuid().as_bytes().as_slice(), self.encode(f)?);
-        // Maintain the path → file_id secondary index. We always write the
-        // current path; stale entries from path renames are an open
-        // limitation of this baseline (see FUTURE_IMPROVEMENTS) but for
-        // create+delete (the only mutators wired today) the mapping is
-        // correct.
+        // Maintain the path → file_id secondary index.
         txn.put(
             ColumnFamily::PathIndex,
             f.path.value.as_bytes().to_vec(),

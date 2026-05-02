@@ -22,3 +22,25 @@ anyhow = "1"
 indicatif = "0.17"
 blake3 = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+axum = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+os-api = { path = "../src/api" }
+os-crypto = { path = "../src/crypto" }
+os-events = { path = "../src/events" }
+os-identity = { path = "../src/identity" }
+os-lease = { path = "../src/lease" }
+os-metadata = { path = "../src/metadata" }
+os-plugin-host = { path = "../src/plugin_host" }
+os-recovery = { path = "../src/recovery" }
+os-repair = { path = "../src/repair" }
+os-sync = { path = "../src/sync" }
+os-types = { path = "../src/types" }
+os-vault = { path = "../src/vault" }
+os-vfs = { path = "../src/vfs" }
+os-wal = { path = "../src/wal" }

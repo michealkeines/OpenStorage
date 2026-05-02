@@ -131,6 +131,8 @@ pub fn router(state: AppState) -> Router {
             "/v1/vaults/:vault_id/files/*path",
             get(get_file)
                 .put(put_file)
+                .patch(patch_file)
+                .post(move_file)
                 .head(head_file)
                 .delete(delete_file),
         )
@@ -297,6 +299,147 @@ async fn head_file(
         HeaderValue::from_str(&meta.file_id.to_string()).unwrap(),
     );
     Ok((StatusCode::OK, headers))
+}
+
+/// F-FL-5 Rename/Move. Route shape: `POST /v1/vaults/{v}/files/{src}/move`
+/// with body `{ "to": "/dst" }`. The wildcard `*path` captures `<src>/move`;
+/// we strip the trailing `/move` segment to recover the source path.
+#[derive(Deserialize)]
+struct MoveReq {
+    to: String,
+}
+
+async fn move_file(
+    State(s): State<AppState>,
+    Path((_vault_id, path)): Path<(String, String)>,
+    Json(req): Json<MoveReq>,
+) -> Result<Json<FileMetaJson>, ApiError> {
+    let path = format!("/{path}");
+    let src = path
+        .strip_suffix("/move")
+        .ok_or_else(|| ApiError::bad("move requires URL ending in /move"))?;
+    if src.is_empty() {
+        return Err(ApiError::bad("source path is empty"));
+    }
+    let dst = if req.to.starts_with('/') {
+        req.to
+    } else {
+        format!("/{}", req.to)
+    };
+    let meta = s.vfs.rename(src, &dst).map_err(|e| match e {
+        os_vfs::VfsError::NotFound(_) => ApiError::not_found(format!("rename: {e}")),
+        os_vfs::VfsError::VaultLocked => ApiError::locked(format!("rename: {e}")),
+        other => ApiError::bad(format!("rename: {other}")),
+    })?;
+    Ok(Json(FileMetaJson {
+        file_id: meta.file_id.to_string(),
+        path: meta.path,
+        size_bytes: meta.size_bytes,
+        modified_at: meta.modified_at.0.clone(),
+        content_type: meta.content_type,
+    }))
+}
+
+/// F-FL-3 Partial write. Per STATES_AND_FLOWS §2.2 F-FL-3: same as F-FL-2 but
+/// only re-encrypts affected chunks. Baseline implementation here splices the
+/// supplied range into the existing plaintext and re-writes the file via the
+/// normal write path. The chunk-granular optimization is an internal detail
+/// that doesn't change the API contract.
+async fn patch_file(
+    State(s): State<AppState>,
+    Path((_vault_id, path)): Path<(String, String)>,
+    request: Request,
+) -> Result<impl IntoResponse, ApiError> {
+    let path = format!("/{path}");
+    let cr = request
+        .headers()
+        .get("content-range")
+        .ok_or_else(|| ApiError::bad("PATCH requires Content-Range header"))?
+        .to_str()
+        .map_err(|_| ApiError::bad("invalid Content-Range header"))?
+        .to_string();
+    let (start, end, total) = parse_content_range(&cr)?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
+        .await
+        .map_err(|e| ApiError::bad(format!("read body: {e}")))?;
+    let expected_len = end - start + 1;
+    if body_bytes.len() as u64 != expected_len {
+        return Err(ApiError::bad(format!(
+            "body length {} does not match Content-Range span {}",
+            body_bytes.len(),
+            expected_len
+        )));
+    }
+
+    // Read existing plaintext (file must exist; PATCH is not a creator).
+    let mut current = match s.vfs.read(&path).await {
+        Ok(b) => b,
+        Err(os_vfs::VfsError::VaultLocked) => {
+            return Err(ApiError::locked("patch: vault locked"));
+        }
+        Err(os_vfs::VfsError::NotFound(_)) => {
+            return Err(ApiError::not_found("patch: file not found"));
+        }
+        Err(e) => return Err(ApiError::bad(format!("patch: {e}"))),
+    };
+    if (current.len() as u64) < total && (total as usize) > current.len() {
+        current.resize(total as usize, 0);
+    }
+    let s_idx = start as usize;
+    let e_idx = (end + 1) as usize;
+    if e_idx > current.len() {
+        current.resize(e_idx.max(total as usize), 0);
+    }
+    current[s_idx..e_idx].copy_from_slice(&body_bytes);
+    if (current.len() as u64) > total {
+        current.truncate(total as usize);
+    }
+
+    let meta = s
+        .vfs
+        .write(&path, &current)
+        .await
+        .map_err(|e| ApiError::bad(format!("patch: {e}")))?;
+    Ok((
+        StatusCode::OK,
+        Json(FileMetaJson {
+            file_id: meta.file_id.to_string(),
+            path: meta.path,
+            size_bytes: meta.size_bytes,
+            modified_at: meta.modified_at.0.clone(),
+            content_type: meta.content_type,
+        }),
+    ))
+}
+
+/// Parse a `Content-Range: bytes <start>-<end>/<total>` header.
+fn parse_content_range(s: &str) -> Result<(u64, u64, u64), ApiError> {
+    let s = s.trim();
+    let rest = s
+        .strip_prefix("bytes ")
+        .ok_or_else(|| ApiError::bad("Content-Range must start with 'bytes '"))?;
+    let (range, total) = rest
+        .split_once('/')
+        .ok_or_else(|| ApiError::bad("Content-Range missing '/total'"))?;
+    let total: u64 = total
+        .parse()
+        .map_err(|_| ApiError::bad("Content-Range total not a number"))?;
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| ApiError::bad("Content-Range missing '-'"))?;
+    let start: u64 = start
+        .parse()
+        .map_err(|_| ApiError::bad("Content-Range start not a number"))?;
+    let end: u64 = end
+        .parse()
+        .map_err(|_| ApiError::bad("Content-Range end not a number"))?;
+    if end < start {
+        return Err(ApiError::bad("Content-Range end < start"));
+    }
+    if end >= total {
+        return Err(ApiError::bad("Content-Range end >= total"));
+    }
+    Ok((start, end, total))
 }
 
 async fn delete_file(
@@ -1229,6 +1372,468 @@ mod tests {
         assert_eq!(get_resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(get_resp.into_body(), 8192).await.unwrap();
         assert_eq!(&body[..], b"hello via api");
+    }
+
+    async fn create_vault_for_test(app: &Router) -> String {
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/vaults")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"passphrase":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(create_resp.into_body(), 8192).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        parsed["vault_id"].as_str().unwrap().to_string()
+    }
+
+    /// F-FL-5 — POST /files/{src}/move renames; src 404s; dst served.
+    #[tokio::test]
+    async fn move_file_via_api() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        // PUT a file
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/old.txt"))
+                    .body(Body::from("contents"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // POST .../move
+        let mv = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/files/old.txt/move"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"to":"/new.txt"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mv.status(), StatusCode::OK);
+        // GET old → 404
+        let old = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/files/old.txt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old.status(), StatusCode::NOT_FOUND);
+        // GET new → 200 with contents
+        let new = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/files/new.txt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(new.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(new.into_body(), 8192).await.unwrap();
+        assert_eq!(&body[..], b"contents");
+    }
+
+    /// F-FL-5 — rename of nonexistent source returns 404.
+    #[tokio::test]
+    async fn move_missing_returns_404() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let mv = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/files/missing.txt/move"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"to":"/x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mv.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// F-FL-3 — PATCH with Content-Range overwrites the named byte range.
+    #[tokio::test]
+    async fn patch_byte_range() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/data.bin"))
+                    .body(Body::from(b"AAAAAAAAAAAA".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Patch bytes 4..=7 with "ZZZZ"
+        let patch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/v1/vaults/{vault_id}/files/data.bin"))
+                    .header("content-range", "bytes 4-7/12")
+                    .body(Body::from(b"ZZZZ".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::OK);
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/files/data.bin"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(r.into_body(), 8192).await.unwrap();
+        assert_eq!(&body[..], b"AAAAZZZZAAAA");
+    }
+
+    /// F-FL-3 — PATCH with Content-Range that grows the file resizes it.
+    #[tokio::test]
+    async fn patch_grows_file() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/g.bin"))
+                    .body(Body::from(b"hello".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let patch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/v1/vaults/{vault_id}/files/g.bin"))
+                    .header("content-range", "bytes 5-9/10")
+                    .body(Body::from(b"WORLD".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::OK);
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/files/g.bin"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(r.into_body(), 8192).await.unwrap();
+        assert_eq!(&body[..], b"helloWORLD");
+    }
+
+    /// F-FL-3 — PATCH on a missing file returns 404.
+    #[tokio::test]
+    async fn patch_missing_returns_404() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/v1/vaults/{vault_id}/files/missing"))
+                    .header("content-range", "bytes 0-2/3")
+                    .body(Body::from(b"abc".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// F-FL-3 — PATCH without Content-Range header is rejected.
+    #[tokio::test]
+    async fn patch_without_content_range_400() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/x"))
+                    .body(Body::from(b"hello".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/v1/vaults/{vault_id}/files/x"))
+                    .body(Body::from(b"X".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// F-FL-6 — HEAD returns size + file_id without a body.
+    #[tokio::test]
+    async fn head_returns_metadata_without_body() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/h.txt"))
+                    .body(Body::from("12345"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri(format!("/v1/vaults/{vault_id}/files/h.txt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get("x-size-bytes").unwrap().to_str().unwrap(),
+            "5"
+        );
+        assert!(r.headers().get("x-file-id").is_some());
+    }
+
+    /// F-FL-4 — DELETE makes the file invisible to subsequent GETs (404).
+    #[tokio::test]
+    async fn delete_then_get_returns_404() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/vaults/{vault_id}/files/d.txt"))
+                    .body(Body::from("bye"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/vaults/{vault_id}/files/d.txt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+        let g = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/files/d.txt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(g.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// F-VL-4 — DELETE /v1/vaults/{v} requires the confirm header and
+    /// transitions the vault to Destroyed.
+    #[tokio::test]
+    async fn destroy_vault_via_api() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        // Without header → 400.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/vaults/{vault_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        // With header → 200.
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/vaults/{vault_id}"))
+                    .header("x-confirm-destroy", "yes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let st = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/system/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(st.into_body(), 8192).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["state"], "destroyed");
+    }
+
+    /// F-VL-5 — POST /rotate-mk swaps the unlock secret.
+    #[tokio::test]
+    async fn rotate_mk_via_api() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/rotate-mk"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"new_passphrase":"new"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        // Lock then unlock with new pass.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/lock"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let unlock = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/unlock"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"passphrase":"new"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlock.status(), StatusCode::NO_CONTENT);
+        // Old passphrase rejected.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/lock"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bad = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/unlock"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"passphrase":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 6.A.4 — POST /recovery/rotate-token returns a new token id and the
+    /// active-set count stays at 1 (the new id replaces the old).
+    #[tokio::test]
+    async fn rotate_recovery_token_via_api() {
+        let app = build_app();
+        let vault_id = create_vault_for_test(&app).await;
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/recovery/rotate-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), 8192).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["new_token_id"].as_str().is_some());
+
+        let g = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/vaults/{vault_id}/recovery"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(g.into_body(), 8192).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["active_token_count"].as_u64().unwrap(), 1);
     }
 
     #[tokio::test]
