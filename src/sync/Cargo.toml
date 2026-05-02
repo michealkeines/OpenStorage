@@ -14,7 +14,8 @@ os-crypto = { workspace = true }
 os-events = { workspace = true }
 thiserror = { workspace = true }
 ciborium = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
-uuid = { workspace = true }
+serde = { workspace = true }

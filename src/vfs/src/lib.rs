@@ -951,20 +951,65 @@ impl VfsService {
     }
 
     pub fn list(&self, prefix: &str) -> Result<Vec<FileMeta>, VfsError> {
+        // F-MD-3 same-path collision projection (DESIGN §6.13). When two
+        // distinct file_ids resolve to the same path on this device (e.g.,
+        // device A creates F1 at /x while device B renames F2 to /x and
+        // both writes are observed), the LWW-loser is rendered at
+        // `/x.conflict-{loser_hlc}-{loser_file_id[:8]}` so directory
+        // listings remain deterministic across devices.
+        let mut by_path: std::collections::BTreeMap<String, Vec<File>> =
+            std::collections::BTreeMap::new();
+        for f in self.iter_all_files_with_prefix(prefix)? {
+            if !f.exists.value {
+                continue;
+            }
+            by_path.entry(f.path.value.clone()).or_default().push(f);
+        }
         let mut out = Vec::new();
-        for f in self.store.list_files_with_prefix(prefix)? {
-            if f.exists.value {
+        for (path, mut bucket) in by_path {
+            // LWW winner first; losers get conflict-suffix paths.
+            bucket.sort_by(|a, b| match a.path.hlc.cmp(&b.path.hlc) {
+                std::cmp::Ordering::Equal => {
+                    a.path.device_id.0.as_bytes().cmp(b.path.device_id.0.as_bytes())
+                }
+                o => o,
+            });
+            let winner = bucket.pop().expect("non-empty bucket");
+            out.push(FileMeta {
+                file_id: winner.file_id,
+                path: winner.path.value.clone(),
+                size_bytes: winner.size_bytes.value,
+                modified_at: winner.modified_at.value,
+                content_type: winner.content_type.value,
+                exists: winner.exists.value,
+            });
+            for loser in bucket {
+                let suffix = conflict_suffix(loser.path.hlc, loser.file_id);
+                let conflicted_path = format!("{}.conflict-{}", path, suffix);
                 out.push(FileMeta {
-                    file_id: f.file_id,
-                    path: f.path.value,
-                    size_bytes: f.size_bytes.value,
-                    modified_at: f.modified_at.value,
-                    content_type: f.content_type.value,
-                    exists: f.exists.value,
+                    file_id: loser.file_id,
+                    path: conflicted_path,
+                    size_bytes: loser.size_bytes.value,
+                    modified_at: loser.modified_at.value,
+                    content_type: loser.content_type.value,
+                    exists: loser.exists.value,
                 });
             }
         }
         Ok(out)
+    }
+
+    /// Internal helper: scan files under a prefix. Walks the Files CF
+    /// directly (not the PathIndex) so F-MD-3 same-path collisions surface
+    /// every record at the path, not just whichever one last won the
+    /// secondary-index write.
+    fn iter_all_files_with_prefix(&self, prefix: &str) -> Result<Vec<File>, VfsError> {
+        Ok(self
+            .store
+            .iter_files()?
+            .into_iter()
+            .filter(|f| f.path.value.starts_with(prefix))
+            .collect())
     }
 
     fn find_by_path(&self, path: &str) -> Result<Option<File>, VfsError> {
@@ -1180,6 +1225,15 @@ fn group_lookup(
     out
 }
 
+/// Deterministic suffix for F-MD-3 conflict projection. Encodes
+/// `{hlc_physical}-{hlc_logical}-{file_id[:8]}` so all devices observing
+/// the same losing record produce the same conflict-path.
+fn conflict_suffix(hlc: Hlc, file_id: FileId) -> String {
+    let bytes = file_id.as_uuid().as_bytes();
+    let head: String = bytes[..4].iter().map(|b| format!("{:02x}", b)).collect();
+    format!("{}-{}-{}", hlc.physical, hlc.logical, head)
+}
+
 /// AAD for inline file payloads. Bound to `(file_id, file_key_version)` —
 /// the version makes ciphertext from a previous key generation
 /// non-decryptable after F-SH-3 rotates.
@@ -1368,6 +1422,51 @@ mod tests {
         assert!(inbox.iter().all(|f| f.path != "/inbox/a.txt"));
         let archive = svc.list("/archive/").unwrap();
         assert!(archive.iter().any(|f| f.path == "/archive/a.txt"));
+    }
+
+    /// F-MD-3 — same-path collision: two distinct file_ids that resolve
+    /// to the same path on this device. `list` projects the LWW-loser at
+    /// `<path>.conflict-{hlc}-{file_id_head}` so every device renders the
+    /// collision deterministically.
+    #[tokio::test]
+    async fn list_renders_same_path_conflict_for_distinct_file_ids() {
+        let (svc, _pid, _) = fixture_with_local_plugin();
+        // Author file F1 at /x normally.
+        svc.write("/x", b"first").await.unwrap();
+        // Inject a second File record (F2) at the same path with a
+        // *higher* HLC so F2 wins the LWW race; F1 becomes the conflict.
+        // We do this by reaching into the store directly; user code
+        // never produces this state itself.
+        let device = svc.sync.wal().device_id();
+        let f2_id = FileId::new_v7();
+        let hlc = Hlc::new(999, 0);
+        let f2 = os_entities::File {
+            file_id: f2_id,
+            path: LwwRegister::new("/x".into(), hlc, device),
+            size_bytes: LwwRegister::new(7, hlc, device),
+            created_at: LwwRegister::new(Timestamp::from_string("now"), hlc, device),
+            modified_at: LwwRegister::new(Timestamp::from_string("now"), hlc, device),
+            permissions: LwwRegister::new(Permissions::default(), hlc, device),
+            content_type: LwwRegister::new(String::new(), hlc, device),
+            tier_pinned: LwwRegister::new(None, hlc, device),
+            inline_payload: None,
+            chunk_list: None,
+            wrapped_keys: OrSet::new(),
+            acl: OrSet::new(),
+            exists: LwwRegister::new(true, hlc, device),
+            file_key_version: 0,
+        };
+        let mut t = Txn::new();
+        svc.store.put_file(&mut t, &f2).unwrap();
+        svc.store.commit(t).unwrap();
+
+        let listing = svc.list("/").unwrap();
+        let paths: Vec<_> = listing.iter().map(|m| m.path.clone()).collect();
+        assert!(paths.contains(&"/x".to_string()));
+        assert!(
+            paths.iter().any(|p| p.starts_with("/x.conflict-")),
+            "expected one conflict-suffixed path; got {paths:?}"
+        );
     }
 
     /// F-FL-5 — renaming a missing path returns NotFound.

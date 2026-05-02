@@ -101,6 +101,15 @@ impl Timestamp {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+    /// Parse an `epoch:N` form (used by the engine's `now_iso` helper) into
+    /// raw seconds. Returns `None` for any other shape so callers can decide
+    /// whether to fall back. Used by lease-steal staleness math.
+    pub fn epoch_secs(&self) -> Option<u64> {
+        self.0.strip_prefix("epoch:").and_then(|s| s.parse().ok())
+    }
+    pub fn from_epoch_secs(s: u64) -> Self {
+        Self(format!("epoch:{s}"))
+    }
 }
 
 /// Snapshot version counter. Never decreases; rollback detection refuses any

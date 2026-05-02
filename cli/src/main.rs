@@ -305,6 +305,13 @@ enum LeaseCmd {
     Acquire,
     Renew,
     Release,
+    /// CAS-overwrite a stale lease (F-MD-4). The TTL must be the value the
+    /// prior holder was using; the steal succeeds only if 2×ttl seconds
+    /// have elapsed since the prior expires_at.
+    Steal {
+        #[arg(long, default_value_t = 30)]
+        ttl_secs: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1082,6 +1089,23 @@ async fn lease_cmd(client: &reqwest::Client, base: &str, cmd: LeaseCmd) -> Resul
                 bail!("release failed: {s} {body}");
             }
             println!("✓ lease released");
+        }
+        LeaseCmd::Steal { ttl_secs } => {
+            let resp = client
+                .post(format!("{url_base}/steal"))
+                .json(&serde_json::json!({"ttl_secs": ttl_secs}))
+                .send()
+                .await?;
+            if resp.status().as_u16() == 409 {
+                bail!("lease still live (cannot steal yet)");
+            }
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                bail!("steal failed: {s} {body}");
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ lease stolen: {}", serde_json::to_string_pretty(&body)?);
         }
     }
     Ok(())

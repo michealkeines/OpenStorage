@@ -114,6 +114,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(release_lease),
         )
         .route("/v1/vaults/:vault_id/lease/renew", post(renew_lease))
+        .route("/v1/vaults/:vault_id/lease/steal", post(steal_lease))
         .route("/v1/vaults/:vault_id/wal", get(get_wal))
         .route("/v1/vaults/:vault_id/snapshot", get(get_snapshot))
         .route("/v1/vaults/:vault_id/providers", get(list_providers))
@@ -571,6 +572,20 @@ impl ApiError {
             message: msg.into(),
         }
     }
+    fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: msg.into(),
+        }
+    }
+    /// 410 Gone — used for `lease.lost`. Frontends should treat this as a
+    /// terminal "you no longer hold the lease" signal.
+    fn lost(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -745,12 +760,31 @@ async fn get_lease(
     Json(serde_json::json!({ "state": state }))
 }
 
+#[derive(Deserialize, Default)]
+struct AcquireLeaseReq {
+    /// Override "now" for deterministic tests. Real callers omit it.
+    #[serde(default)]
+    now_epoch_secs: Option<u64>,
+    /// TTL in seconds (default 30).
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
 async fn acquire_lease(
     State(s): State<AppState>,
     Path(_vault_id): Path<String>,
+    body: Option<Json<AcquireLeaseReq>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let now = os_types::Timestamp::from_string("now");
-    let expires = os_types::Timestamp::from_string("now+30s");
+    let req = body.map(|j| j.0).unwrap_or_default();
+    let now_secs = req.now_epoch_secs.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    let ttl = req.ttl_secs.unwrap_or(30);
+    let now = os_types::Timestamp::from_epoch_secs(now_secs);
+    let expires = os_types::Timestamp::from_epoch_secs(now_secs + ttl);
     let r = s
         .lease
         .acquire(s.device_id, now, expires)
@@ -767,13 +801,71 @@ async fn renew_lease(
     State(s): State<AppState>,
     Path(_vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let r = s
         .lease
-        .renew(os_types::Timestamp::from_string("now+30s"))
-        .map_err(|e| ApiError::bad(format!("lease: {e}")))?;
+        .renew(os_types::Timestamp::from_epoch_secs(now_secs + 30))
+        .map_err(|e| match e {
+            // F-MD-4: renew failure after a steal surfaces as `lease.lost`.
+            os_lease::LeaseError::Lost => {
+                s.events.publish(os_events::Event::new("lease.lost"));
+                ApiError::lost("lease lost")
+            }
+            other => ApiError::bad(format!("lease: {other}")),
+        })?;
     Ok(Json(serde_json::json!({
         "lease_id": r.lease_id.to_string(),
         "renewal_count": r.renewal_count,
+        "state": "held",
+    })))
+}
+
+#[derive(Deserialize)]
+struct StealLeaseReq {
+    /// Caller-provided "now" in `epoch:N` form for staleness math.
+    #[serde(default)]
+    now_epoch_secs: Option<u64>,
+    /// New lease expiry (seconds since epoch).
+    #[serde(default)]
+    expires_at_epoch_secs: Option<u64>,
+    /// TTL the prior holder was using; staleness threshold = 2 × ttl.
+    ttl_secs: u64,
+}
+
+/// F-MD-4 — POST /v1/vaults/{v}/lease/steal. Refuses with 409 if the
+/// existing lease is still live; CAS-overwrites if it has aged past 2×TTL.
+async fn steal_lease(
+    State(s): State<AppState>,
+    Path(_vault_id): Path<String>,
+    Json(req): Json<StealLeaseReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let now_secs = req.now_epoch_secs.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    let expires = req
+        .expires_at_epoch_secs
+        .unwrap_or(now_secs + req.ttl_secs);
+    let r = s
+        .lease
+        .try_steal(
+            s.device_id,
+            os_types::Timestamp::from_epoch_secs(now_secs),
+            os_types::Timestamp::from_epoch_secs(expires),
+            req.ttl_secs,
+        )
+        .map_err(|e| match e {
+            os_lease::LeaseError::StillLive => ApiError::conflict("lease still live"),
+            other => ApiError::bad(format!("steal: {other}")),
+        })?;
+    Ok(Json(serde_json::json!({
+        "lease_id": r.lease_id.to_string(),
+        "holder_device_id": r.holder_device_id.to_string(),
         "state": "held",
     })))
 }
@@ -2185,6 +2277,163 @@ mod tests {
         let body = axum::body::to_bytes(g.into_body(), 8192).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["active_token_count"].as_u64().unwrap(), 1);
+    }
+
+    /// F-MD-4 — `try_steal` while the lease is still live returns 409.
+    /// After 2×TTL has elapsed the steal succeeds, and the prior holder's
+    /// renew returns 410 Gone.
+    #[tokio::test]
+    async fn lease_steal_via_api() {
+        // We need two services sharing a lease registry to simulate two
+        // devices; mount our own router with a shared registry pointing
+        // at the same vault.
+        let store = Arc::new(Store::new(Arc::new(MemoryBackend::new())));
+        let host = Arc::new(Host::new());
+        let identity = Arc::new(IdentityService::new(store.clone()));
+        let vault = Arc::new(VaultManager::new(store.clone(), host.clone()));
+        let mut tdir = std::env::temp_dir();
+        tdir.push(format!("os-api-lease-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tdir).unwrap();
+        let (sk, _pk) = generate_keypair(&mut OsRng);
+        let dev_a = DeviceId::new_v7();
+        let dev_b = DeviceId::new_v7();
+        let wal = WalBuilder::new()
+            .path(tdir.join("wal.bin"))
+            .build(dev_a, sk)
+            .unwrap();
+        let sync = Arc::new(SyncEngine::new(Arc::new(wal)));
+        let recovery = Arc::new(RecoveryService::new(
+            store.clone(),
+            identity.clone(),
+            vault.clone(),
+        ));
+        let vfs = Arc::new(VfsService::new(store.clone(), vault.clone(), sync));
+        let registry = os_lease::new_registry();
+        let lease_a = Arc::new(os_lease::LeaseService::with_registry(registry.clone()));
+        let lease_b = Arc::new(os_lease::LeaseService::with_registry(registry));
+        let repair = Arc::new(os_repair::RepairScheduler::new(1024));
+        let events = Arc::new(os_events::EventBus::new());
+        let share = Arc::new(os_share::ShareService::new(store.clone(), vfs.clone()));
+        let app_a = router(AppState {
+            recovery: recovery.clone(),
+            vault: vault.clone(),
+            vfs: vfs.clone(),
+            identity: identity.clone(),
+            lease: lease_a.clone(),
+            repair: repair.clone(),
+            events: events.clone(),
+            host: host.clone(),
+            share: share.clone(),
+            device_id: dev_a,
+            fault: None,
+            plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        });
+        let app_b = router(AppState {
+            recovery,
+            vault,
+            vfs,
+            identity,
+            lease: lease_b,
+            repair,
+            events,
+            host,
+            share,
+            device_id: dev_b,
+            fault: None,
+            plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        });
+        let vault_id = create_vault_for_test(&app_a).await;
+
+        // A acquires at a fixed "now=0" with TTL=30.
+        let acq = app_a
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/lease"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"now_epoch_secs": 0, "ttl_secs": 30})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let acq_status = acq.status();
+        let acq_body = axum::body::to_bytes(acq.into_body(), 8192).await.unwrap();
+        assert_eq!(
+            acq_status,
+            StatusCode::OK,
+            "acquire body: {:?}",
+            String::from_utf8_lossy(&acq_body)
+        );
+
+        // B tries to steal while still live → 409.
+        let steal_too_soon = app_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/lease/steal"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "now_epoch_secs": 30,
+                            "expires_at_epoch_secs": 60,
+                            "ttl_secs": 30,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let s = steal_too_soon.status();
+        let b = axum::body::to_bytes(steal_too_soon.into_body(), 8192)
+            .await
+            .unwrap();
+        assert_eq!(
+            s,
+            StatusCode::CONFLICT,
+            "steal body: {:?}",
+            String::from_utf8_lossy(&b)
+        );
+
+        // B steals after 2×TTL.
+        let stolen = app_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/lease/steal"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "now_epoch_secs": 1000,
+                            "expires_at_epoch_secs": 1030,
+                            "ttl_secs": 30,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stolen.status(), StatusCode::OK);
+
+        // A's renew now returns 410 Gone (lease.lost).
+        let renew = app_a
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/vaults/{vault_id}/lease/renew"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renew.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
