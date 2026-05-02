@@ -343,6 +343,18 @@ enum ShadowsCmd {
 #[derive(Subcommand, Debug)]
 enum RepairCmd {
     Show,
+    /// F-HM-1 — kick a sampled scrub batch.
+    Scrub {
+        #[arg(long, default_value_t = 50)]
+        per_thousand: u32,
+    },
+    /// F-HM-5 — kick a GC sweep over zero-refcount chunks.
+    Gc,
+    /// F-HM-4 — kick rebalance enqueue.
+    Rebalance {
+        #[arg(long, default_value_t = 100)]
+        per_thousand: u32,
+    },
     /// Manually enqueue a repair task (test-only).
     Enqueue {
         /// 32-byte chunk hash, hex-encoded.
@@ -1249,6 +1261,41 @@ async fn repair_cmd(client: &reqwest::Client, base: &str, cmd: RepairCmd) -> Res
                 .await?;
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        RepairCmd::Scrub { per_thousand } => {
+            let resp = client
+                .post(format!("{base}/v1/system/scrub"))
+                .json(&serde_json::json!({"fraction_per_thousand": per_thousand}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                bail!("scrub failed: {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ scrub enqueued {} tasks", body["enqueued"]);
+        }
+        RepairCmd::Gc => {
+            let resp = client
+                .post(format!("{base}/v1/system/gc"))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                bail!("gc failed: {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ gc enqueued {} tasks", body["enqueued"]);
+        }
+        RepairCmd::Rebalance { per_thousand } => {
+            let resp = client
+                .post(format!("{base}/v1/vaults/{}/rebalance", st.vault_id))
+                .json(&serde_json::json!({"fraction_per_thousand": per_thousand}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                bail!("rebalance failed: {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await?;
+            println!("✓ rebalance enqueued {} tasks", body["enqueued"]);
         }
         RepairCmd::Enqueue { chunk_hash, priority, source } => {
             let resp = client

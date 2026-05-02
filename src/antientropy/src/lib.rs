@@ -14,6 +14,8 @@ use thiserror::Error;
 pub enum AntiEntropyError {
     #[error("tree size mismatch: local {local}, remote {remote}")]
     SizeMismatch { local: usize, remote: usize },
+    #[error("forged page at leaf {index}: hash mismatch")]
+    ForgedPage { index: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +67,52 @@ fn remote_root_from_leaves(leaves: &[BlakeHash]) -> BlakeHash {
     *level.first().unwrap_or(&BlakeHash::from_bytes([0u8; 32]))
 }
 
+/// F-HM-3 — pull divergent pages from a remote replica and apply them.
+///
+/// `pages` is a `(leaf_index → page_bytes)` mapping the caller fetched
+/// from the remote replica for the indices identified by `compare()`. The
+/// hash check is the integrity guarantee: forged pages don't satisfy the
+/// remote leaf hash and are rejected (per spec edge case "Replica
+/// returning forged Merkle root: page-level hash check during pull
+/// catches the fraud").
+///
+/// Apply is delegated via the supplied `apply_page` closure — the caller
+/// owns the metadata mutation; this module owns the divergence walk and
+/// integrity check.
+pub fn apply_divergent_pages<F>(
+    report: &DivergenceReport,
+    remote_leaves: &[BlakeHash],
+    pages: &[(usize, Vec<u8>)],
+    mut apply_page: F,
+) -> Result<usize, AntiEntropyError>
+where
+    F: FnMut(usize, &[u8]),
+{
+    let mut applied = 0usize;
+    for (idx, bytes) in pages {
+        // Page must hash to the remote leaf hash for that index.
+        let want = remote_leaves
+            .get(*idx)
+            .ok_or(AntiEntropyError::SizeMismatch {
+                local: remote_leaves.len(),
+                remote: *idx,
+            })?;
+        let got = BlakeHash::from_bytes(*blake3::hash(bytes).as_bytes());
+        if &got != want {
+            return Err(AntiEntropyError::ForgedPage { index: *idx });
+        }
+        if !report.divergent_leaf_indices.contains(idx) {
+            // Caller asked us to apply a page for an index we never marked
+            // as divergent — almost certainly a bug; ignore it rather than
+            // silently overwriting the local copy.
+            continue;
+        }
+        apply_page(*idx, bytes);
+        applied += 1;
+    }
+    Ok(applied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +124,43 @@ mod tests {
         let r = compare(&a, &b_leaves).unwrap();
         assert!(r.divergent_leaf_indices.is_empty());
         assert_eq!(r.local_root, r.remote_root);
+    }
+
+    /// F-HM-3 — divergent pages are applied iff their hash matches the
+    /// remote leaf. Forged pages raise `ForgedPage`. Builds a synthetic
+    /// `DivergenceReport` so this test stays decoupled from the real
+    /// 32K-leaf Merkle layout.
+    #[test]
+    fn divergent_page_application_with_hash_check() {
+        let remote_page = b"remote-page-bytes";
+        let remote_leaf = BlakeHash::from_bytes(*blake3::hash(remote_page).as_bytes());
+        // Two synthetic leaves; only leaf index 1 differs.
+        let remote_leaves = vec![BlakeHash::from_bytes([1u8; 32]), remote_leaf];
+        let report = DivergenceReport {
+            local_root: BlakeHash::from_bytes([0u8; 32]),
+            remote_root: BlakeHash::from_bytes([0u8; 32]),
+            divergent_leaf_indices: vec![1],
+        };
+
+        let mut applied: Vec<(usize, Vec<u8>)> = Vec::new();
+        let n = apply_divergent_pages(
+            &report,
+            &remote_leaves,
+            &[(1, remote_page.to_vec())],
+            |idx, bytes| applied.push((idx, bytes.to_vec())),
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(applied, vec![(1, remote_page.to_vec())]);
+
+        // A forged page (claims to be at leaf 1 but doesn't hash to its
+        // leaf) is rejected.
+        let err = apply_divergent_pages(
+            &report,
+            &remote_leaves,
+            &[(1, b"forged-content".to_vec())],
+            |_, _| {},
+        );
+        assert!(matches!(err, Err(AntiEntropyError::ForgedPage { .. })));
     }
 }

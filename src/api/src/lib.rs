@@ -151,6 +151,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(delete_file),
         )
         .route("/v1/vaults/:vault_id/dirs", get(list_dir))
+        .route("/v1/system/scrub", post(system_scrub))
+        .route("/v1/system/gc", post(system_gc))
+        .route("/v1/vaults/:vault_id/rebalance", post(system_rebalance))
         .route("/v1/system/fault", get(get_fault).post(set_fault).delete(clear_fault))
         .route(
             "/v1/vaults/:vault_id/providers/:provider_id/state",
@@ -1396,6 +1399,53 @@ async fn push_snapshot_route(
     })))
 }
 
+#[derive(Deserialize, Default)]
+struct SweepReq {
+    /// For scrub: per-thousand sample size (default 50 = 5%).
+    /// For rebalance: per-thousand fraction (default 100 = 10%).
+    #[serde(default)]
+    fraction_per_thousand: Option<u32>,
+}
+
+/// F-HM-1 — POST /v1/system/scrub. Enqueues a sampled scrub batch.
+async fn system_scrub(
+    State(s): State<AppState>,
+    body: Option<Json<SweepReq>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let req = body.map(|j| j.0).unwrap_or_default();
+    let n = s
+        .repair
+        .scrub_sweep(&s.vault.store(), req.fraction_per_thousand.unwrap_or(50))
+        .map_err(|e| ApiError::bad(format!("scrub: {e}")))?;
+    Ok(Json(serde_json::json!({ "enqueued": n })))
+}
+
+/// F-HM-5 — POST /v1/system/gc. Enqueues GC-sweep tasks for any chunk
+/// whose refcount has dropped to ≤ 0.
+async fn system_gc(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let n = s
+        .repair
+        .gc_sweep(&s.vault.store())
+        .map_err(|e| ApiError::bad(format!("gc: {e}")))?;
+    Ok(Json(serde_json::json!({ "enqueued": n })))
+}
+
+/// F-HM-4 — POST /v1/vaults/{v}/rebalance. Triggered by the engine after
+/// a plugin add or by an operator; enqueues a fraction of chunks for
+/// placement re-evaluation.
+async fn system_rebalance(
+    State(s): State<AppState>,
+    Path(_vault_id): Path<String>,
+    body: Option<Json<SweepReq>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let req = body.map(|j| j.0).unwrap_or_default();
+    let n = s
+        .repair
+        .rebalance_on_plugin_add(&s.vault.store(), req.fraction_per_thousand.unwrap_or(100))
+        .map_err(|e| ApiError::bad(format!("rebalance: {e}")))?;
+    Ok(Json(serde_json::json!({ "enqueued": n })))
+}
+
 async fn get_fault(State(s): State<AppState>) -> Json<serde_json::Value> {
     if let Some(f) = &s.fault {
         return Json((f.snapshot)());
@@ -2277,6 +2327,42 @@ mod tests {
         let body = axum::body::to_bytes(g.into_body(), 8192).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["active_token_count"].as_u64().unwrap(), 1);
+    }
+
+    /// F-HM-1 / F-HM-5 — POST /v1/system/scrub and /gc enqueue tasks
+    /// against the repair scheduler. With no chunks the count is 0 but
+    /// the route succeeds.
+    #[tokio::test]
+    async fn system_scrub_and_gc_routes_succeed() {
+        let app = build_app();
+        let _ = create_vault_for_test(&app).await;
+        let scrub = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/system/scrub")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scrub.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(scrub.into_body(), 4096).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["enqueued"].is_u64());
+
+        let gc = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/system/gc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gc.status(), StatusCode::OK);
     }
 
     /// F-MD-4 — `try_steal` while the lease is still live returns 409.

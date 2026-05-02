@@ -15,3 +15,5 @@ os-chunk = { workspace = true }
 os-events = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+ciborium = { workspace = true }
+blake3 = { workspace = true }

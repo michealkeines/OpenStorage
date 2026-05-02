@@ -1924,6 +1924,8 @@ dependencies = [
 name = "os-repair"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "ciborium",
  "os-chunk",
  "os-entities",
  "os-events",
@@ -2028,6 +2030,7 @@ dependencies = [
  "os-metadata",
  "os-placement",
  "os-plugin-host",
+ "os-repair",
  "os-sync",
  "os-types",
  "os-vault",

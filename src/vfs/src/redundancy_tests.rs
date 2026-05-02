@@ -300,6 +300,47 @@ async fn replication_3_writes_to_3_distinct_trust_groups() {
     assert!(found_chunks >= 2);
 }
 
+/// F-HM-2 — when a shard fetch errors during a read, the VFS enqueues a
+/// HIGH-priority `ReadRepair` task on the attached scheduler. The read
+/// itself still succeeds from the surviving shards.
+#[tokio::test]
+async fn read_repair_enqueued_on_shard_failure() {
+    let f = fixture(3, 1, 4096);
+    let scheduler = Arc::new(os_repair::RepairScheduler::new(64));
+    // Re-wrap the existing Vfs config with the scheduler attached.
+    let svc = Arc::new(
+        VfsService::with_host(
+            f.store.clone(),
+            f.svc.vault().clone(),
+            f.svc.sync().clone(),
+            f.svc.plugin_host().clone(),
+            f.svc.config(),
+        )
+        .with_repair(scheduler.clone()),
+    );
+
+    let payload = random_payload(8192);
+    svc.write("/r", &payload).await.unwrap();
+
+    // Make providers 0 and 1 fail gets so the read has to fall through
+    // to provider 2; at least one fetch must error.
+    f.providers[0].1.fail_gets.store(true, Ordering::SeqCst);
+    f.providers[1].1.fail_gets.store(true, Ordering::SeqCst);
+
+    let got = svc.read("/r").await.unwrap();
+    assert_eq!(got, payload);
+
+    // At least one ReadRepair task is now on the queue.
+    let depth = scheduler.state().depth;
+    assert!(
+        depth >= 1,
+        "expected at least one ReadRepair task enqueued, got depth={depth}"
+    );
+    let task = scheduler.drain_one().expect("a repair task");
+    assert!(matches!(task.source, os_repair::RepairSource::ReadRepair));
+    assert_eq!(task.priority, 100);
+}
+
 /// k=1, n=3: with one provider down, reads still succeed.
 #[tokio::test]
 async fn read_succeeds_when_one_provider_offline() {

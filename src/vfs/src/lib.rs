@@ -30,6 +30,7 @@ use os_entities::{
 use os_metadata::{Store, Txn};
 use os_placement::{pick_shards_for_chunk, select_ec_scheme, DiversityPolicy, EcTargets};
 use os_plugin_host::Host;
+use os_repair::{RepairScheduler, RepairSource, RepairTask};
 use os_sync::SyncEngine;
 use os_types::{
     AeadSuite, ChunkHash, ECScheme, FileId, HealthScore, Hlc, KeyPurpose, ProviderId, ShardId,
@@ -149,6 +150,10 @@ pub struct VfsService {
     vault: Arc<VaultManager>,
     sync: Arc<SyncEngine>,
     plugin_host: Arc<Host>,
+    /// F-HM-2: when set, shard fetch failures during read enqueue a
+    /// HIGH-priority `ReadRepair` task. Optional so single-instance test
+    /// fixtures don't have to wire one in.
+    repair: Option<Arc<RepairScheduler>>,
     cfg: VfsConfig,
 }
 
@@ -182,12 +187,31 @@ impl VfsService {
             vault,
             sync,
             plugin_host,
+            repair: None,
             cfg,
         }
+    }
+    /// Attach a repair scheduler so failed shard fetches enqueue
+    /// HIGH-priority `ReadRepair` tasks (F-HM-2).
+    pub fn with_repair(mut self, repair: Arc<RepairScheduler>) -> Self {
+        self.repair = Some(repair);
+        self
     }
 
     pub fn config(&self) -> VfsConfig {
         self.cfg
+    }
+    pub fn vault(&self) -> &Arc<VaultManager> {
+        &self.vault
+    }
+    pub fn sync(&self) -> &Arc<SyncEngine> {
+        &self.sync
+    }
+    pub fn plugin_host(&self) -> &Arc<Host> {
+        &self.plugin_host
+    }
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 
     // ─── small/buffered helpers ────────────────────────────────────────────
@@ -771,6 +795,7 @@ impl VfsService {
         let file_key = derive_file_key(&mk, file.file_id, file.file_key_version)?;
         let fetch_concurrency = cfg.chunk_fetch_concurrency.max(1);
         let read_hedge = cfg.read_hedge as usize;
+        let repair = self.repair.clone();
         let stream = async_stream::try_stream! {
             use futures::stream::FuturesOrdered;
             use futures::StreamExt;
@@ -790,8 +815,9 @@ impl VfsService {
                     let plugin_host = plugin_host.clone();
                     let file_key = file_key.clone();
                     let aead_suite = cfg.aead_suite;
+                    let repair = repair.clone();
                     let fut = read_one_chunk(
-                        store, plugin_host, ch, idx, file_key, aead_suite, read_hedge,
+                        store, plugin_host, ch, idx, file_key, aead_suite, read_hedge, repair,
                     );
                     inflight.push_back(Box::pin(fut));
                 }
@@ -1044,6 +1070,7 @@ async fn read_one_chunk(
     file_key: os_crypto::SymKey,
     aead_suite: AeadSuite,
     read_hedge: usize,
+    repair: Option<Arc<RepairScheduler>>,
 ) -> Result<Bytes, VfsError> {
     use os_plugin_host::Op;
 
@@ -1177,6 +1204,17 @@ async fn read_one_chunk(
                     "shard fetch failed; falling back"
                 );
                 errors.push(format!("{provider_id}: {e}"));
+                // F-HM-2 inline read repair: enqueue a HIGH-priority
+                // ReadRepair task. We continue to serve the read from
+                // the remaining shards; repair runs in background.
+                if let Some(r) = &repair {
+                    let _ = r.enqueue(RepairTask {
+                        chunk_hash,
+                        priority: 100,
+                        source: RepairSource::ReadRepair,
+                        attempt: 0,
+                    });
+                }
                 // Replenish from the next-ranked untried candidate so the
                 // race continues with a full set of fetches in flight.
                 while next_candidate < ranked.len() {

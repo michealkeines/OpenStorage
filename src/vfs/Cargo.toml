@@ -17,6 +17,7 @@ os-placement = { workspace = true }
 os-plugin-host = { workspace = true }
 os-bloom = { workspace = true }
 os-events = { workspace = true }
+os-repair = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
