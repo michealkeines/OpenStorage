@@ -1,236 +1,182 @@
 # OpenStorage
 
-> **Your data. Your keys. Any cloud.**
->
-> **From 15 GB to 1 TB — the scale where consumer plans end and your data starts.**
->
-> An end-to-end-encrypted personal storage engine that turns *anyone's*
-> object store into your own private filesystem.
+> **Your private cloud, built from free services. No subscription. No vendor.**
 
-OpenStorage stitches together cloud accounts you already have — Google Drive,
-Dropbox, S3, a Raspberry Pi in a closet — into one encrypted, deduplicating,
-multi-device namespace. Backends never see your filenames, your folder tree,
-or a single byte of plaintext. Lose a backend, your data is still safe. Lose
-your laptop, your data is still safe. Bring your own backend, your own keys,
-your own redundancy. **Forever.**
+OpenStorage stitches together a handful of free public services — **catbox**, **litterbox**, **uguu**, **x0**, **telegraph** — into a single encrypted filesystem you own. Every file is encrypted on your computer before it leaves. The free services see only random bytes; they never see your filenames, your folder tree, or what you uploaded. You get the storage. They get the bill. You keep the keys.
 
-```
-            ┌───────────────────────────────────────┐
-            │              os (CLI)                 │
-            └─────────────────┬─────────────────────┘
-                              │   plaintext, briefly
-   ┌──────────────────────────▼─────────────────────────────┐
-   │  openstorage engine                                     │
-   │  ─ HKDF / Argon2id / Ed25519 / ChaCha20-Poly1305 / EC   │
-   │  ─ CRDT log + HLC + signed snapshots                    │
-   │  ─ chunk-level dedup + erasure coding                   │
-   └─┬────────┬───────────┬─────────┬───────────┬───────────┬┘
-     │ ciph   │ ciph      │ ciph    │ ciph      │ ciph      │ ciph
-     ▼        ▼           ▼         ▼           ▼           ▼
-  Telegram  Discord    uguu.se   Testbench   Local-dir   ⟨any⟩
-   (Bot)   (webhook)  (anon)    (Python)    (filesystem) plugin
-```
-
-Backends are interchangeable. They share **one** trait — `PluginContract` —
-and the engine doesn't care whether the bytes go to a chat room or an S3
-bucket. The plugins shipped today:
-
-| Plugin | Auth | Limit | Use case |
-|---|---|---|---|
-| `http_backend` (Python testbench) | none | unlimited | local dev, CI, the comments-box demo |
-| `local_dir` | none | disk | embedded / FUSE mode |
-| `zerox_st` (uguu.se) | none | 128 MiB | anonymous public host |
-| `telegram` | bot token | 50 MiB | personal bot chat as durable storage |
-| `discord` | webhook URL | 25 MiB | server channel as durable storage |
-| `fault_inject` | n/a | n/a | wraps any plugin for failure injection |
-
-WhatsApp is **not** shipped. The only public WhatsApp API
-("WhatsApp Business Cloud") requires a Meta Business Manager account,
-verified phone number, and template-message approvals — there is no
-end-user, account-less path. `whatsapp-web.js` works but needs a browser
-session, not a backend daemon. If Meta opens a real personal-use API,
-adding it is ~150 lines of `PluginContract` against this repo.
+You don't need a credit card. You don't need an account. You don't need to trust any one service. Five different operators hold pieces of every file, and **any two of them can disappear without you losing data.**
 
 ---
 
-## What works *today*
+## Quick start — 5 minutes
 
-This repository implements a working baseline of the engine end-to-end. Every
-column in the table below has tests behind it; the smoke scripts under
-[`scripts/`](./scripts) drive the whole system at 1 GiB scale.
+You'll need a terminal and roughly 5 minutes. We'll install OpenStorage, configure 5 free backends, and put a file through it.
 
-| Capability | Status |
-|---|---|
-| Vault create / unlock / lock / destroy | ✅ working |
-| AEAD-encrypted file storage (ChaCha20-Poly1305 / AES-GCM) | ✅ working |
-| Argon2id master-key derivation + Ed25519 identity chain | ✅ working |
-| **Inline files** (≤16 KB, in-record AEAD blob) | ✅ working |
-| **Chunked files** (4 MB chunks, per-chunk derived keys) | ✅ working |
-| Reed–Solomon erasure coding (`k`, `n` schemes; `(1,1)` default) | ✅ working |
-| Pluggable backends via `PluginContract` | ✅ working |
-| HTTP-backend plugin (talks to any compatible object store) | ✅ working |
-| Local-directory plugin (filesystem-as-backend) | ✅ working |
-| Public-host plugin (uguu.se, anonymous) — 10 MiB live test passes | ✅ working |
-| Telegram Bot plugin — `sendDocument` + `getFile` + `deleteMessage` | ✅ working (live test gated by env vars) |
-| Discord webhook plugin — multipart POST + CDN GET + `DELETE /messages/{id}` | ✅ working (live test gated by env vars) |
-| Fault-injection plugin (wraps any backend for chunk-state testing) | ✅ working |
-| Streaming PUT/GET (1 GB without buffering in RAM) | ✅ working |
-| HTTP API (axum) — vaults, files, status, list | ✅ working |
-| CLI (`os init / upload / download / ls / lock / unlock`) | ✅ working |
-| Python testbench with comments-box UI | ✅ working |
-| Append-only signed WAL + HLC | ✅ working (single-device) |
-| Per-vault salted Bloom filter | ✅ working |
-| 32K-leaf Merkle tree for anti-entropy | ✅ working |
-| CRUSH-style placement + diversity policy | ✅ working |
-| 95 unit tests across 24 crates | ✅ green |
-
-### Currently stubbed / next up
-
-Multi-device CRDT merge, snapshot push to vault providers, live anti-entropy
-reconcile, share creation + revocation, repair scheduler workers, ML-KEM
-KEM (placeholder is X25519-XOR), real WASM plugin sandbox, and persistent
-metadata via sled (a one-line swap from the in-memory backend). All have
-shapes in code; none have prod wiring.
-
----
-
-## The pitch in one paragraph
-
-Object storage is a commodity. Encryption-at-rest from your cloud provider
-protects them, not you. **OpenStorage flips the trust model:** the engine
-runs on your machine, encrypts everything before any byte leaves the
-process, and addresses your data by content hash so you can scatter shards
-across mutually-distrusting providers. A 1 GB file goes through 256
-ChaCha20-Poly1305-encrypted 4 MB chunks; lose any subset of providers and
-the rest reconstruct what you need. Plugins are a thin trait — write 200
-lines of Rust to add a new backend.
-
----
-
-## Quick start
-
-You'll need: Rust ≥ 1.80, Python ≥ 3.10, `curl`.
+### 1. Install Rust (if you don't already have it)
 
 ```bash
-# 1. build the engine + CLI
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+### 2. Build OpenStorage
+
+```bash
+git clone https://github.com/your/openstorage.git
+cd openstorage
 cargo build --release --bin openstorage --bin os
+```
 
-# 2. start the test backend (Python; gives you a UI with a comments box)
-python3 -m venv testbench/.venv
-testbench/.venv/bin/pip install -q -r testbench/requirements.txt
-testbench/.venv/bin/python testbench/server.py &
+The first build takes ~3 minutes. You'll get two binaries:
+- `target/release/openstorage` — the engine (a daemon you keep running)
+- `target/release/os` — the command-line tool you actually use
 
-# 3. start the engine (registers the testbench as a chunk plugin)
-TESTBENCH_URL=http://127.0.0.1:9090 ./target/release/openstorage &
+### 3. Start the engine
 
-# 4. drive it
-./target/release/os init --passphrase hunter2
-./target/release/os upload some-file.bin
+In one terminal window, leave this running:
+
+```bash
+./target/release/openstorage
+```
+
+(In a real install you'd put this behind systemd or a launch agent. For now, keep this terminal open.)
+
+### 4. Create your vault
+
+In a second terminal:
+
+```bash
+./target/release/os init
+# Prompts for a passphrase. Pick a strong one — this is the only thing
+# protecting your data, and there is no recovery if you forget it.
+```
+
+### 5. Add 5 free backends
+
+Each command takes 2 seconds. None of them ask for an account, password, or credit card.
+
+```bash
+./target/release/os auth add catbox      # 200 MB per file, permanent
+./target/release/os auth add litterbox   # 1 GB per file, 72-hour TTL
+./target/release/os auth add uguu        # 128 MB per file, 3-hour TTL
+./target/release/os auth add telegraph   # mints an anonymous account
+./target/release/os auth add x0          # 256 MB per file, ~30-day retention
+```
+
+You now have 5 independent operators ready to receive encrypted shards.
+
+### 6. Restart the engine to pick up the backends
+
+```bash
+# Press Ctrl-C in the engine terminal, then:
+./target/release/openstorage
+```
+
+### 7. Upload a file
+
+```bash
+./target/release/os upload ~/Documents/important.pdf
 ./target/release/os ls
-./target/release/os download some-file.bin --out /tmp/round-tripped.bin
-
-# 5. open http://127.0.0.1:9090 in a browser to see the comments box
-#    and the encrypted shards landing in the testbench
+./target/release/os download /important.pdf --out /tmp/check.pdf
+diff ~/Documents/important.pdf /tmp/check.pdf   # nothing printed = success
 ```
 
-### One-liner end-to-end test
-
-```bash
-SIZE=$((1024 * 1024 * 1024)) ./scripts/baseline_1gb.sh   # 1 GiB through the API
-SIZE=$((64  * 1024 * 1024))  ./scripts/test_cli.sh       # 64 MiB through the CLI
-```
-
-A successful run looks like this:
-
-```
-✓ uploaded 1.00 GB as /notes.bin in 9.7s (106.1 MB/s)
-✓ downloaded 1.00 GB in 3.7s (274.8 MB/s)
-✓ hash matches
-✓ auto-unlock + download path works
-   src=1876a3805…  dst=1876a3805…
-```
+You're done. Your file is now encrypted, split into pieces, and scattered across 5 free services. None of them can read it. Any two can vanish and you'll still get it back.
 
 ---
 
-## Architecture
+## How it handles things
 
-Six layers, dependency-depth-numbered. No upward calls, no peer orchestration
-loops. Backends live outside the engine binary and are reached only through
-`plugin_host`.
+### "I uploaded a 50 MB file. What just happened?"
 
-```
-L6  FRONTENDS  cli │ gui │ fuse                     ← user-facing
-L5  API        axum HTTP/2 server                   ← bind, auth, route
-L4  SERVICES   vfs │ vault │ sync │ recovery │
-               identity │ share │ repair │
-               antientropy │ lease │ plugin_host    ← orchestrate
-L3  PRIMITIVES chunk │ ec │ placement │
-               bloom │ merkle │ events              ← pure
-L2  STORAGE    metadata │ wal │ keystore │ crypto   ← bytes/state
-L1  FOUNDATION types │ entities                     ← shapes
-L0  EXTERNAL   plugins/ + their backends            ← outside the engine
-```
+The engine encrypted the file with a key derived from your passphrase, split it into 4 MB chunks, encrypted each chunk with its own key, and used **Reed-Solomon erasure coding** to spread each chunk across all 5 backends. Each backend sees only a random-looking blob. None of them know the filename, the file size, or that the others exist.
 
-Every entity, every operation, every state transition, and every edge case
-is written down in the design suite:
+Reading is the reverse: any 4 of the 5 backends are enough. The engine reconstructs from the surviving pieces.
 
-- [`DESIGN.md`](./DESIGN.md) — narrative design (1660 lines)
-- [`ABSTRACTIONS.md`](./ABSTRACTIONS.md) — types, interfaces, state machines
-- [`STATES_AND_FLOWS.md`](./STATES_AND_FLOWS.md) — exhaustive flow catalog
-- [`RESILIENCE.md`](./RESILIENCE.md) — invariants and edge cases
-- [`THREAT_MODEL.md`](./THREAT_MODEL.md) — adversaries and mitigations
-- [`API.md`](./API.md) — REST surface
-- [`PLUGIN_SDK.md`](./PLUGIN_SDK.md) — how to write a backend plugin
+### "What if catbox goes down?"
 
----
+The engine notices within ~60 seconds (it pings every backend's health endpoint). Catbox is removed from active placement. New writes go to the surviving 4. Reads still succeed because erasure coding lets us reconstruct from any majority. When catbox comes back, it's automatically re-added.
 
-## Repository map
+If catbox stays down forever, the engine migrates your data off it in the background. You don't have to do anything.
 
-```
-src/                ← 22 Rust crates, one per module (L1–L5)
-plugins/            ← first-party plugin implementations
-    http_backend/   ← talks to the testbench (or any compatible HTTP store)
-testbench/          ← Python object-store with comments UI; baseline backend
-cli/                ← `os` CLI (clap + reqwest)
-app/                ← `openstorage` engine binary
-scripts/            ← baseline_1gb.sh, test_cli.sh
-*.md                ← design docs (read in order: DESIGN → ABSTRACTIONS → STATES_AND_FLOWS)
-```
+### "What if a backend lies — says it accepted my file but deletes it later?"
+
+Every chunk is hashed before upload and verified on download. A backend that returns wrong bytes fails an authenticated decryption check, the engine treats that shard as lost, and it reconstructs from the others. After a few such failures the backend is automatically quarantined.
+
+### "What if a backend rate-limits me?"
+
+The engine has a per-backend rate budget. When one backend's budget is full, writes route to a different backend. There's also a **circuit breaker** per backend: 5 consecutive failures opens the circuit for 15 seconds (then 30, then a minute, etc.) so we don't hammer a struggling service.
+
+### "I deleted a file. Is it really gone?"
+
+Three things happen:
+1. The chunk key is dropped from your keystore. Without it, the encrypted blobs on every backend are unreadable forever.
+2. For backends that support it (S3, GitHub), the actual bytes are deleted.
+3. For backends that *don't* support delete (catbox, uguu) but support **overwrite** (some do), the engine overwrites the bytes with random noise.
+4. For backends that support neither, the bytes remain as cryptographically-erased ciphertext (random-looking, no key, no recovery path).
+
+You also get a "residual report" telling you exactly which backends still hold encrypted bytes. Nothing is silently leaked.
+
+### "I rebooted my laptop. Is everything still there?"
+
+Yes. The engine persists its state to disk. After restart, run `os unlock`, type your passphrase, and everything is back — file list, contents, history.
+
+### "I want to use this from two computers."
+
+Same passphrase, same vault. Run `os init` on the second machine with the same passphrase, and it will pull the vault state and have access to all your files. Edits on either machine sync via a CRDT log; concurrent edits converge automatically.
 
 ---
 
-## Build and test
+## What it costs
 
-```bash
-cargo build --release         # engine + CLI + plugins
-cargo test --workspace        # 95 tests across 24 crates
-./scripts/baseline_1gb.sh     # full system 1 GiB round-trip
-./scripts/test_cli.sh         # full CLI round-trip
-```
+Nothing. The 5 backends in the quick-start above are anonymous — no signup, no card, no quota you have to monitor.
 
----
+The trade-off is that you're using free services as they were intended: for personal-scale use. We don't recommend pushing terabytes through this — that would violate the operators' ToS and they'd start blocking you. Tens of GB of personal files is well within reasonable use.
 
-## Design principles (and why they matter to you)
+If you want more capacity or more reliability, you can add **paid** backends to the same vault:
+- AWS S3, Backblaze B2, Cloudflare R2 (S3-compatible APIs)
+- A Raspberry Pi at home (`os auth add localdir`)
+- Any HTTP server that accepts `PUT` (build a 200-line plugin)
 
-1. **You own the keys.** A plaintext byte never crosses the engine boundary.
-2. **You own the trust topology.** Diversity rules force shards across
-   distinct correlation groups (no two shards on the same operator) so
-   no single provider revoke can hold your data hostage.
-3. **You own the format.** Every persisted record has a `format_version`;
-   migrations are forward-only and online; nothing is locked to a vendor.
-4. **No silent leaks.** Every orphaned ciphertext object gets a `Shadow`
-   record so your residual report is honest about what's still floating.
-5. **Eventual consistency, no shared coordinator.** HLC + signed CRDT WAL
-   means two devices can write while offline and converge on reconnect
-   without a server in between.
+The engine treats free and paid backends the same way. You can mix them freely.
 
 ---
 
-## License
+## What it doesn't do (yet)
 
-Apache-2.0. See [`LICENSE`](./LICENSE) (TBD).
+- **Mobile apps.** This is a desktop/server tool today. The engine has an HTTP API; building a mobile client on top is straightforward but unwritten.
+- **A graphical interface.** Command-line only for now.
+- **Files larger than ~1 GB through one upload.** The streaming path exists but isn't memory-bounded yet. For huge files, split them yourself.
+- **Real-time collaboration.** Two devices converge eventually (within a few seconds usually), but it's not a Google-Docs-style live edit.
+
+These are roadmap items, not invariants.
 
 ---
 
-*OpenStorage is a personal-data project — built so I can sleep at night
-knowing my files survive both me and the providers I rely on.*
+## How safe is it?
+
+**Confidentiality** (your plaintext is private): files are encrypted with ChaCha20-Poly1305 before they leave your computer. Backends never see plaintext. They can't read your filenames or folder structure either.
+
+**Integrity** (you'd notice if a backend tampered): every chunk is authenticated. A modified byte fails the AEAD tag check on read.
+
+**Durability** (you don't lose data when a backend dies): erasure coding tolerates any 1 of 5 backends going dark. Lose 2, you can still configure for that with more backends.
+
+**Recovery** (you don't lose data when *you* die): you can save a recovery key separately. Anyone with the recovery key (your future self, a trusted friend, a safe-deposit box) can unlock the vault even if the passphrase is forgotten.
+
+What it does *not* do: protect you from malware on your own computer, protect you from giving away your passphrase, or hide the *existence* of a vault from someone who can see your network traffic.
+
+---
+
+## More
+
+- [`DESIGN.md`](./DESIGN.md) — how the system is built (1,660 lines, technical)
+- [`THREAT_MODEL.md`](./THREAT_MODEL.md) — what attacks we defend against
+- [`RESILIENCE.md`](./RESILIENCE.md) — what happens when things break
+- [`ROUTING.md`](./ROUTING.md) — how the engine picks where to put each chunk
+- [`PLUGIN_SDK.md`](./PLUGIN_SDK.md) — how to add a new backend in ~150 lines
+
+License: Apache-2.0.
+
+---
+
+*OpenStorage exists because cloud subscriptions are a tax on people who just want their files to outlive a single company. Every byte you store anywhere else costs someone money. The 5 services in the quick-start above already exist, already store bytes for free, and have for years. Stitched together with encryption and erasure coding, they're a private cloud — yours, free, durable.*

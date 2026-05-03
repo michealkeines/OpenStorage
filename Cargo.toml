@@ -37,6 +37,13 @@ members = [
     "plugins/catbox",
     "plugins/paste_rs",
     "plugins/filebin",
+    "plugins/litterbox",
+    "plugins/bashupload",
+    "plugins/temp_sh",
+    "plugins/oshi",
+    "plugins/pixeldrain",
+    "plugins/pomf_clone",
+    "plugins/x0clone",
 ]
 
 [workspace.package]
@@ -112,6 +119,13 @@ os-plugin-github-repo = { path = "plugins/github_repo" }
 os-plugin-catbox = { path = "plugins/catbox" }
 os-plugin-paste-rs = { path = "plugins/paste_rs" }
 os-plugin-filebin = { path = "plugins/filebin" }
+os-plugin-litterbox = { path = "plugins/litterbox" }
+os-plugin-bashupload = { path = "plugins/bashupload" }
+os-plugin-temp-sh = { path = "plugins/temp_sh" }
+os-plugin-oshi = { path = "plugins/oshi" }
+os-plugin-pixeldrain = { path = "plugins/pixeldrain" }
+os-plugin-pomf-clone = { path = "plugins/pomf_clone" }
+os-plugin-x0clone = { path = "plugins/x0clone" }
 
 [profile.dev]
 opt-level = 0

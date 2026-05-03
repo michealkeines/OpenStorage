@@ -28,8 +28,15 @@ use os_entities::{
     ReplicationState, Shard, AckState,
 };
 use os_metadata::{Store, Txn};
-use os_placement::{pick_shards_for_chunk, select_ec_scheme, DiversityPolicy, EcTargets};
-use os_plugin_host::Host;
+use os_placement::{
+    eligibility_filter, pick_shards_for_chunk, select_ec_scheme, DiversityPolicy, EcTargets,
+    PlacementRequest,
+};
+use os_plugin_host::{
+    slotpool::{SizeClass, SlotOwnerId, SlotPool},
+    Host,
+};
+use os_types::UpdateCapability;
 use os_repair::{RepairScheduler, RepairSource, RepairTask};
 use os_sync::SyncEngine;
 use os_types::{
@@ -154,6 +161,13 @@ pub struct VfsService {
     /// HIGH-priority `ReadRepair` task. Optional so single-instance test
     /// fixtures don't have to wire one in.
     repair: Option<Arc<RepairScheduler>>,
+    /// ROUTING.md §5 — tracker for reusable slots on Update-capable
+    /// backends. Fresh writes that land on an Update-capable provider
+    /// allocate a slot; subsequent writes that fit a Forgotten slot's
+    /// size class call `plugin.update(handle, …)` instead of `put`,
+    /// avoiding shadow accumulation. Always present (in-memory; cold on
+    /// restart until persistence lands as a separate sub-step).
+    slot_pool: Arc<SlotPool>,
     cfg: VfsConfig,
 }
 
@@ -188,8 +202,73 @@ impl VfsService {
             sync,
             plugin_host,
             repair: None,
+            slot_pool: Arc::new(SlotPool::new()),
             cfg,
         }
+    }
+
+    /// Replace the engine's slot pool. Used by tests that want to
+    /// inspect slot state directly. Defaults to a fresh in-memory pool.
+    pub fn with_slot_pool(mut self, pool: Arc<SlotPool>) -> Self {
+        self.slot_pool = pool;
+        self
+    }
+
+    pub fn slot_pool(&self) -> Arc<SlotPool> {
+        self.slot_pool.clone()
+    }
+
+    /// **Crypto-erasure pass** (ROUTING.md §5.5).
+    ///
+    /// Walks every Forgotten slot on a `TrueUpdate`-capable provider
+    /// and overwrites its bytes-at-rest with random noise via the
+    /// plugin's `update()`. Each successful overwrite transitions the
+    /// slot to `Empty`. Failed overwrites leave the slot in
+    /// `Forgotten`; the next pass tries again.
+    ///
+    /// Why this matters: a backend that *can't delete* but *can*
+    /// overwrite still satisfies invariant I5 (no silent leaks). After
+    /// erasure the bytes are structurally a uniform random blob with
+    /// no AEAD tag and no key — cryptographically indistinguishable
+    /// from `/dev/random`. The shadow record still exists for
+    /// accounting, but the residual exposure is gone.
+    ///
+    /// Only `TrueUpdate` providers participate. `AtomicReplace`
+    /// erasure would issue a *new* handle (creating a fresh orphan),
+    /// defeating the purpose; the slot pool excludes them from
+    /// `pending_erasure`.
+    ///
+    /// Returns the count of slots successfully erased on this pass.
+    pub async fn erase_pending_slots(&self) -> Result<usize, VfsError> {
+        use rand::RngCore;
+        let pending = self.slot_pool.pending_erasure();
+        let mut erased = 0usize;
+        for slot in pending {
+            let handle = match slot.current_handle.as_ref() {
+                Some(h) => h.clone(),
+                None => continue,
+            };
+            let plugin = match self.plugin_host.get_chunk(slot.provider_id) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            // Random noise of the slot's *current* size (not the size
+            // class ceiling). The plugin's view of the handle is
+            // unchanged in length, so a peek's `content-length` stays
+            // consistent.
+            let mut buf = vec![0u8; slot.current_size as usize];
+            rand::thread_rng().fill_bytes(&mut buf);
+            match plugin.update(&handle, &buf).await {
+                Ok(_) => {
+                    self.slot_pool.mark_erased(slot.slot_id);
+                    erased += 1;
+                }
+                Err(_) => {
+                    // Leave the slot in Forgotten. Next pass retries.
+                }
+            }
+        }
+        Ok(erased)
     }
     /// Attach a repair scheduler so failed shard fetches enqueue
     /// HIGH-priority `ReadRepair` tasks (F-HM-2).
@@ -529,14 +608,31 @@ impl VfsService {
         // own scheme; deployments scale from (1,1) on a single-group pool
         // through replication on small pools to (k, n) parity coding once
         // ≥k+1 distinct trust groups are configured.
-        let scheme = select_ec_scheme(&pool, self.cfg.ec_targets);
+        // ROUTING.md §13 Step 4 — filter the pool by per-provider
+        // `max_object_bytes` BEFORE selecting the EC scheme. A pool
+        // shrunk to fewer trust groups must drive `n` lower; otherwise
+        // we'd commit to a scheme `pick_shards` can't satisfy.
+        let chunk_bytes = plaintext.len() as u64;
+        let prelim_scheme = os_types::ECScheme::new(1, 1).expect("trivial scheme");
+        let prelim_req = PlacementRequest::for_chunk(chunk_h, chunk_bytes, prelim_scheme);
+        let eligible = eligibility_filter(&prelim_req, &pool);
+        if eligible.providers.is_empty() {
+            return Err(VfsError::Placement(format!(
+                "no eligible providers for {chunk_bytes}-byte chunk (every backend's max_object_bytes is below this size)"
+            )));
+        }
+
+        let scheme = select_ec_scheme(&eligible, self.cfg.ec_targets);
         let enc = encrypt_and_encode(plaintext, chunk_h, chunk_key, self.cfg.aead_suite, scheme, None)?;
 
         let policy = DiversityPolicy {
             require_distinct_trust_groups: scheme.n > 1,
             prefer_legal_diversity: false,
         };
-        let picks = pick_shards_for_chunk(chunk_h, scheme, &pool, policy, Tier::Hot)?;
+        // Build the real request now that the scheme is known and pick
+        // against the filtered pool only.
+        let req = PlacementRequest::for_chunk(chunk_h, chunk_bytes, scheme);
+        let picks = pick_shards_for_chunk(&req, &eligible, policy)?;
         if picks.len() != enc.shards.len() {
             return Err(VfsError::Placement(format!(
                 "placement returned {} picks, expected {}",
@@ -545,42 +641,107 @@ impl VfsService {
             )));
         }
 
-        // Build (shard_index → candidate_list) where the primary is the
-        // placement choice and same-trust-group siblings are dispatcher
-        // fallbacks (rate-limit liveness, not redundancy).
-        let primary_groups = group_lookup(&pool, &picks);
-        let mut already_used: std::collections::BTreeSet<os_types::TrustCorrelationGroup> =
-            std::collections::BTreeSet::new();
+        // Build (shard_index → candidate_list) per ROUTING.md §4.6 with
+        // **three tiers** of fallback:
+        //
+        //   1. Primary (placement decision, content-addressed).
+        //   2. Same-trust-group siblings (rate-limit liveness; same
+        //      diversity guarantees as the primary).
+        //   3. Cross-trust-group overflow — providers in trust groups
+        //      that no other shard's primary uses. To preserve R1
+        //      (distinct trust groups across the chunk's shards) under
+        //      parallel dispatch, each overflow group is **pre-assigned
+        //      to exactly one shard**. Two shards can never both fail
+        //      over into the same overflow group because they don't
+        //      share overflow candidates.
+        //
+        // All sibling/overflow lookups use the *eligible* pool — i.e.,
+        // post Stage-1 filter. A provider that's too small for this
+        // chunk is excluded from every list, so the dispatcher won't try
+        // it and surface a hard size error.
+        let primary_groups = group_lookup(&eligible, &picks);
+        let primary_groups_set: std::collections::BTreeSet<os_types::TrustCorrelationGroup> =
+            primary_groups.values().cloned().collect();
+        // Stable-ordered list of overflow groups (each appearing once)
+        // and providers belonging to each.
+        let overflow_group_order: Vec<os_types::TrustCorrelationGroup> = {
+            let mut seen: std::collections::BTreeSet<os_types::TrustCorrelationGroup> =
+                std::collections::BTreeSet::new();
+            let mut order: Vec<os_types::TrustCorrelationGroup> = Vec::new();
+            for entry in &eligible.providers {
+                if primary_groups_set.contains(&entry.trust_group) {
+                    continue;
+                }
+                if seen.insert(entry.trust_group.clone()) {
+                    order.push(entry.trust_group.clone());
+                }
+            }
+            order
+        };
+        // ROUTING.md §5: per-shard slot-pool decision. For each shard
+        // primary, ask the slot pool whether a Forgotten slot exists
+        // that fits this chunk's class. If yes, the dispatch fast-path
+        // calls `plugin.update(handle, …)`; on `NotSupported` the slot
+        // is released and we fall through to the standard put_with_fallback.
+        let provider_update_caps: std::collections::BTreeMap<ProviderId, UpdateCapability> =
+            eligible
+                .providers
+                .iter()
+                .map(|p| (p.provider_id, p.update_capability))
+                .collect();
         struct ShardJob {
             shard_index: u8,
             shard_id: os_types::ShardId,
             candidates: Vec<ProviderId>,
             ciphertext: Vec<u8>,
+            primary_id: ProviderId,
+            primary_update_cap: UpdateCapability,
         }
         let mut jobs: Vec<ShardJob> = Vec::with_capacity(enc.shards.len());
-        for (es, (shard_index, primary_id)) in enc.shards.iter().zip(picks.iter()) {
+        for (shard_pos, (es, (shard_index, primary_id))) in
+            enc.shards.iter().zip(picks.iter()).enumerate()
+        {
             let group = primary_groups
                 .get(primary_id)
                 .cloned()
                 .unwrap_or_else(|| os_types::TrustCorrelationGroup::new("unknown"));
             let mut candidates: Vec<ProviderId> = vec![*primary_id];
-            for entry in &pool.providers {
+            // Tier 2: same-group siblings.
+            for entry in &eligible.providers {
                 if entry.provider_id == *primary_id {
                     continue;
                 }
-                if entry.trust_group == group
-                    && (!policy.require_distinct_trust_groups
-                        || !already_used.contains(&entry.trust_group))
-                {
+                if entry.trust_group == group {
                     candidates.push(entry.provider_id);
                 }
             }
-            already_used.insert(group);
+            // Tier 3: this shard's *unique* slice of overflow groups.
+            // Round-robin: shard i gets overflow groups at indices
+            // (i, i+N, i+2N, …) so multi-overflow pools share evenly.
+            if !overflow_group_order.is_empty() {
+                let n = picks.len().max(1);
+                let mut idx = shard_pos;
+                while idx < overflow_group_order.len() {
+                    let g = &overflow_group_order[idx];
+                    for entry in &eligible.providers {
+                        if entry.trust_group == *g {
+                            candidates.push(entry.provider_id);
+                        }
+                    }
+                    idx += n;
+                }
+            }
+            let primary_update_cap = provider_update_caps
+                .get(primary_id)
+                .copied()
+                .unwrap_or(UpdateCapability::None);
             jobs.push(ShardJob {
                 shard_index: *shard_index,
                 shard_id: es.shard_id,
                 candidates,
                 ciphertext: es.ciphertext.clone(),
+                primary_id: *primary_id,
+                primary_update_cap,
             });
         }
 
@@ -607,12 +768,62 @@ impl VfsService {
         > = FuturesUnordered::new();
         for job in jobs {
             let host = self.plugin_host.clone();
+            let slot_pool = self.slot_pool.clone();
             let ct_len = job.ciphertext.len() as u64;
             let shard_index = job.shard_index;
             let shard_id = job.shard_id;
             let candidates = job.candidates;
             let ciphertext = job.ciphertext;
+            let primary_id = job.primary_id;
+            let primary_update_cap = job.primary_update_cap;
+            let owner = make_slot_owner(chunk_h, shard_index);
             let fut = async move {
+                // Stage 3 slot lookup (only when the primary supports
+                // update). On a successful update, return the resulting
+                // dispatched record so the rest of the pipeline doesn't
+                // know the difference.
+                if primary_update_cap.allows_reuse() {
+                    if let Some(slot) = slot_pool.find_forgotten(primary_id, ct_len) {
+                        if let Some(prior_handle) = slot_pool.rebind(slot.slot_id, owner) {
+                            if let Ok(plugin) = host.get_chunk(primary_id) {
+                                match plugin.update(&prior_handle, &ciphertext).await {
+                                    Ok(put_res) => {
+                                        slot_pool.mark_filled(
+                                            slot.slot_id,
+                                            owner,
+                                            put_res.handle.clone(),
+                                            ct_len,
+                                        );
+                                        return (
+                                            shard_index,
+                                            shard_id,
+                                            Ok(os_plugin_host::PutDispatched {
+                                                handle: put_res.handle,
+                                                provider_id: primary_id,
+                                                attempts: 1,
+                                                skipped: 0,
+                                            }),
+                                            ct_len,
+                                        );
+                                    }
+                                    Err(os_plugin_host::PluginError::NotSupported(_)) => {
+                                        // Plugin lied about update_capability;
+                                        // release the slot and fall through.
+                                        slot_pool.release(slot.slot_id);
+                                    }
+                                    Err(_other) => {
+                                        // Real failure on update — release
+                                        // and fall through to put_with_fallback
+                                        // which will likely route elsewhere.
+                                        slot_pool.release(slot.slot_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Standard path: dispatch a fresh put across candidates.
                 let r = os_plugin_host::PoolDispatcher::put_with_fallback(
                     &host,
                     &candidates,
@@ -621,6 +832,26 @@ impl VfsService {
                     os_plugin_host::DispatcherConfig::default(),
                 )
                 .await;
+                if let Ok(dispatched) = &r {
+                    // If the chosen provider is Update-capable, register
+                    // a fresh slot so the next deletion → write cycle on
+                    // a similar-sized chunk can reuse this handle.
+                    let cap = provider_update_caps_for_dispatch(
+                        &host,
+                        dispatched.provider_id,
+                    )
+                    .unwrap_or(UpdateCapability::None);
+                    if cap.allows_reuse() {
+                        let class = SizeClass::ceiling(ct_len);
+                        let slot_id = slot_pool.allocate(dispatched.provider_id, cap, class);
+                        slot_pool.mark_filled(
+                            slot_id,
+                            owner,
+                            dispatched.handle.clone(),
+                            ct_len,
+                        );
+                    }
+                }
                 (shard_index, shard_id, r, ct_len)
             };
             inflight.push(Box::pin(fut));
@@ -867,12 +1098,23 @@ impl VfsService {
         // Register shadows for each shard of each chunk (for chunked files).
         // Shadow records persist regardless of plugin reachability — that's
         // the "no silent leaks" invariant.
+        //
+        // ROUTING.md §5: as we walk the shards we *also* release any
+        // tracked slot for this (provider, handle) pair. The slot stays
+        // around in `Forgotten` state, ready to be rebound by a future
+        // chunk of the same size class. The shadow record persists
+        // alongside until either (a) crypto-erasure overwrites the
+        // bytes (Step 8) or (b) the operator GCs the orphan.
         let mut txn = Txn::new();
         if let Some(chunk_list) = file.chunk_list.clone() {
             for ch in &chunk_list {
                 if let Some(chunk) = self.store.get_chunk(*ch)? {
                     for shard_id in &chunk.shard_list {
                         if let Some(shard) = self.store.get_shard(*shard_id)? {
+                            self.slot_pool.release_by_handle(
+                                shard.driver_id.value,
+                                &shard.native_handle.value,
+                            );
                             let shadow = os_entities::Shadow {
                                 shadow_id: os_types::ShadowId::new_v7(),
                                 original_chunk_hash: *ch,
@@ -1420,6 +1662,33 @@ async fn read_one_chunk(
         ciphertext_length,
     )?;
     Ok(Bytes::from(pt))
+}
+
+/// Build the engine-side slot owner for a (chunk, shard) pair. The
+/// owner lets the slot pool's `lookup_owner` find the slot when the
+/// same logical record is rewritten, and stays stable across runs as
+/// long as `chunk_h` and `shard_index` do.
+///
+/// Encoding: the first 31 bytes of the chunk hash, with `shard_index`
+/// in the last byte. Chunk hashes are uniformly distributed so this
+/// preserves uniqueness across (chunk, shard) pairs without an extra
+/// hash step.
+fn make_slot_owner(chunk_h: ChunkHash, shard_index: u8) -> SlotOwnerId {
+    let mut out = [0u8; 32];
+    out[..31].copy_from_slice(&chunk_h.as_bytes()[..31]);
+    out[31] = shard_index;
+    out
+}
+
+/// Look up a provider's update_capability via its loaded plugin's
+/// rate-limit profile. Used by `persist_chunk` after a fresh put lands
+/// to decide whether to register the slot for future reuse.
+fn provider_update_caps_for_dispatch(
+    host: &Host,
+    provider_id: ProviderId,
+) -> Option<UpdateCapability> {
+    host.rate_limit_profile_for(provider_id)
+        .map(|p| p.update_capability)
 }
 
 fn group_lookup(

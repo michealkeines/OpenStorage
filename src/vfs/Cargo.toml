@@ -27,9 +27,9 @@ os-crypto = { workspace = true }
 os-ec = { workspace = true }
 async-stream = "0.3"
 tracing = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
-rand = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }

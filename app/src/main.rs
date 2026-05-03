@@ -285,9 +285,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(Duration::from_secs)
                 .unwrap_or(Duration::from_secs(10)),
         ));
+        // ROUTING.md §13 Step 3 — periodic plugin.health() pull so
+        // dead providers are detected and quarantined within seconds,
+        // not after the next user-facing put fails.
+        let supplier_health = Arc::new(os_supervisor::SupplierHealthWatcher::new(
+            host.clone(),
+            std::env::var("OPENSTORAGE_SUPPLIER_HEALTH_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(60)),
+        ));
+        // ROUTING.md §13 Step 8 — periodic crypto-erasure of Forgotten
+        // slots on TrueUpdate-capable providers. Preserves I5 (no
+        // silent leaks) on backends that can overwrite but not delete.
+        let slot_eraser = Arc::new(os_supervisor::SlotEraser::new(
+            host.clone(),
+            vfs.slot_pool(),
+            std::env::var("OPENSTORAGE_SLOT_ERASE_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(120)),
+        ));
         let sup = os_supervisor::Supervisor::new(supervisor_cancel.clone())
             .with_worker(scrubber)
-            .with_worker(enforcer);
+            .with_worker(enforcer)
+            .with_worker(supplier_health)
+            .with_worker(slot_eraser);
         tokio::spawn(async move {
             let mut set = sup.run();
             while set.join_next().await.is_some() {}
@@ -480,6 +505,13 @@ fn is_production_kind(kind: &str) -> bool {
             | "telegram"
             | "discord"
             | "github"
+            | "litterbox"
+            | "bashupload"
+            | "temp_sh"
+            | "oshi"
+            | "pixeldrain"
+            | "pomf"
+            | "x0"
     )
 }
 
@@ -534,6 +566,51 @@ async fn load_providers_file(
             "uguu" => Arc::new(os_plugin_zeroxst::ZeroxStPlugin::new()),
             "catbox" => Arc::new(os_plugin_catbox::CatboxPlugin::new()),
             "paste_rs" => Arc::new(os_plugin_paste_rs::PasteRsPlugin::new()),
+            "litterbox" => {
+                let ttl = match entry["ttl"].as_str().unwrap_or("72h") {
+                    "1h" => os_plugin_litterbox::LitterboxTtl::OneHour,
+                    "12h" => os_plugin_litterbox::LitterboxTtl::TwelveHours,
+                    "24h" => os_plugin_litterbox::LitterboxTtl::OneDay,
+                    _ => os_plugin_litterbox::LitterboxTtl::ThreeDays,
+                };
+                Arc::new(os_plugin_litterbox::LitterboxPlugin::with_ttl(ttl))
+            }
+            "bashupload" => Arc::new(os_plugin_bashupload::BashuploadPlugin::new()),
+            "temp_sh" => Arc::new(os_plugin_temp_sh::TempShPlugin::new()),
+            "oshi" => {
+                let mins = entry["expire_minutes"].as_u64().map(|v| v as u32);
+                let plugin = match mins {
+                    Some(m) => os_plugin_oshi::OshiPlugin::with_expiry(m),
+                    None => os_plugin_oshi::OshiPlugin::new(),
+                };
+                Arc::new(plugin)
+            }
+            "pixeldrain" => Arc::new(os_plugin_pixeldrain::PixeldrainPlugin::new()),
+            "pomf" => {
+                let base = match entry["base"].as_str() {
+                    Some(b) => b.to_string(),
+                    None => {
+                        tracing::warn!(label=%label, "pomf entry missing 'base'; skipping");
+                        continue;
+                    }
+                };
+                let upload_path = entry["upload_path"].as_str();
+                Arc::new(os_plugin_pomf_clone::PomfClonePlugin::new(
+                    base,
+                    upload_path,
+                    label.clone(),
+                ))
+            }
+            "x0" => {
+                let base = match entry["base"].as_str() {
+                    Some(b) => b.to_string(),
+                    None => {
+                        tracing::warn!(label=%label, "x0 entry missing 'base'; skipping");
+                        continue;
+                    }
+                };
+                Arc::new(os_plugin_x0clone::X0ClonePlugin::new(base, label.clone()))
+            }
             "filebin" => {
                 let plugin = match entry["bin"].as_str() {
                     Some(b) => os_plugin_filebin::FilebinPlugin::with_bin(b.to_string()),
@@ -627,6 +704,13 @@ async fn load_providers_file(
                     "filebin" => "filebin",
                     "telegram" => "telegram",
                     "discord" => "discord",
+                    "litterbox" => "litterbox",
+                    "bashupload" => "bashupload",
+                    "temp_sh" => "temp-sh",
+                    "oshi" => "oshi",
+                    "pixeldrain" => "pixeldrain",
+                    "pomf" => "pomf",
+                    "x0" => "x0",
                     "local_dir" => "local-dir",
                     _ => "unknown",
                 }
@@ -641,6 +725,13 @@ async fn load_providers_file(
             "filebin" => "org.openstorage.filebin",
             "telegram" => "org.openstorage.telegram",
             "discord" => "org.openstorage.discord",
+            "litterbox" => "org.openstorage.litterbox",
+            "bashupload" => "org.openstorage.bashupload",
+            "temp_sh" => "org.openstorage.temp_sh",
+            "oshi" => "org.openstorage.oshi",
+            "pixeldrain" => "org.openstorage.pixeldrain",
+            "pomf" => "org.openstorage.pomf",
+            "x0" => "org.openstorage.x0",
             "local_dir" => "org.openstorage.local",
             _ => "org.openstorage.unknown",
         };

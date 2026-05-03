@@ -35,6 +35,13 @@ os-plugin-discord = { workspace = true }
 os-plugin-catbox = { workspace = true }
 os-plugin-paste-rs = { workspace = true }
 os-plugin-filebin = { workspace = true }
+os-plugin-litterbox = { workspace = true }
+os-plugin-bashupload = { workspace = true }
+os-plugin-temp-sh = { workspace = true }
+os-plugin-oshi = { workspace = true }
+os-plugin-pixeldrain = { workspace = true }
+os-plugin-pomf-clone = { workspace = true }
+os-plugin-x0clone = { workspace = true }
 ciborium = { workspace = true }
 serde_json = { workspace = true }
 os-lease = { workspace = true }

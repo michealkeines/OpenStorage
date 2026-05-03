@@ -38,6 +38,9 @@ use crate::Result;
 pub struct RecordingChunkPlugin {
     inner: Arc<dyn PluginContract>,
     monitor: Arc<HealthMonitor>,
+    breaker: Arc<crate::CircuitBreaker>,
+    abuse: Arc<crate::AbuseSensor>,
+    drift: Arc<crate::CapabilityDriftDetector>,
     provider_id: ProviderId,
 }
 
@@ -45,11 +48,17 @@ impl RecordingChunkPlugin {
     pub fn new(
         inner: Arc<dyn PluginContract>,
         monitor: Arc<HealthMonitor>,
+        breaker: Arc<crate::CircuitBreaker>,
+        abuse: Arc<crate::AbuseSensor>,
+        drift: Arc<crate::CapabilityDriftDetector>,
         provider_id: ProviderId,
     ) -> Self {
         Self {
             inner,
             monitor,
+            breaker,
+            abuse,
+            drift,
             provider_id,
         }
     }
@@ -62,28 +71,60 @@ impl RecordingChunkPlugin {
                 .record(self.provider_id, crate::host::classify_error(e)),
         }
     }
+
+    /// Op-aware variant: feeds the provider-level monitor, the
+    /// per-(provider, op) circuit breaker, the abuse-budget rolling
+    /// counter (success only), and the capability-drift detector
+    /// (NotSupported only). Steps 9 + 10 + 12.
+    fn record_outcome_op<T>(&self, op: crate::rate_limit::Op, r: &Result<T>) {
+        self.record_outcome(r);
+        match r {
+            Ok(_) => {
+                self.breaker.record_success(self.provider_id, op);
+                self.abuse.record_op(self.provider_id);
+                self.drift.observe_success(self.provider_id, op);
+            }
+            Err(crate::PluginError::NotSupported(_)) => {
+                self.breaker.record_failure(self.provider_id, op);
+                self.drift.observe_not_supported(self.provider_id, op);
+            }
+            Err(_) => {
+                self.breaker.record_failure(self.provider_id, op);
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl PluginContract for RecordingChunkPlugin {
     async fn put(&self, payload: &[u8], hint: &PutHint) -> Result<PutResult> {
         let r = self.inner.put(payload, hint).await;
-        self.record_outcome(&r);
+        self.record_outcome_op(crate::rate_limit::Op::Put, &r);
         r
     }
     async fn get(&self, handle: &NativeHandle, range: Option<Range>) -> Result<Vec<u8>> {
         let r = self.inner.get(handle, range).await;
-        self.record_outcome(&r);
+        self.record_outcome_op(crate::rate_limit::Op::Get, &r);
         r
     }
     async fn peek(&self, handle: &NativeHandle) -> Result<PeekResult> {
         let r = self.inner.peek(handle).await;
-        self.record_outcome(&r);
+        self.record_outcome_op(crate::rate_limit::Op::Peek, &r);
         r
     }
     async fn delete(&self, handle: &NativeHandle) -> Result<DeleteResult> {
         let r = self.inner.delete(handle).await;
-        self.record_outcome(&r);
+        self.record_outcome_op(crate::rate_limit::Op::Delete, &r);
+        r
+    }
+    async fn update(
+        &self,
+        handle: &NativeHandle,
+        payload: &[u8],
+    ) -> Result<PutResult> {
+        let r = self.inner.update(handle, payload).await;
+        // Updates count as Put for breaker accounting.
+        self.record_outcome_op(crate::rate_limit::Op::Put, &r);
         r
     }
     async fn health(&self) -> Result<HealthReport> {

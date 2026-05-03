@@ -40,7 +40,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 pub use enforcer::HealthEnforcer;
+pub use health_watcher::SupplierHealthWatcher;
 pub use scrubber::Scrubber;
+pub use slot_eraser::SlotEraser;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
@@ -377,6 +379,160 @@ mod enforcer {
     }
 }
 
+mod slot_eraser {
+    //! ROUTING.md §13 Step 8 / §5.5 — `SlotEraser`.
+    //!
+    //! Background worker that drives crypto-erasure: periodically asks
+    //! the slot pool for `Forgotten` slots on `TrueUpdate` providers,
+    //! overwrites their bytes-at-rest with random noise via
+    //! `plugin.update`, and transitions each erased slot to `Empty`.
+    //!
+    //! Wraps `os_plugin_host::Host` + `SlotPool` directly so the
+    //! supervisor crate doesn't need a dependency on `os-vfs`. Logic
+    //! mirrors `VfsService::erase_pending_slots` so either entry point
+    //! drives the same outcome.
+    use super::*;
+    use os_plugin_host::{Host, SlotPool};
+    use rand::RngCore;
+
+    pub struct SlotEraser {
+        host: Arc<Host>,
+        pool: Arc<SlotPool>,
+        interval: Duration,
+    }
+
+    impl SlotEraser {
+        pub fn new(host: Arc<Host>, pool: Arc<SlotPool>, interval: Duration) -> Self {
+            Self {
+                host,
+                pool,
+                interval,
+            }
+        }
+
+        /// Pure logic — testable without timers. Returns the count of
+        /// slots erased on this pass.
+        pub async fn erase_once(&self) -> Result<usize> {
+            let pending = self.pool.pending_erasure();
+            let mut erased = 0usize;
+            for slot in pending {
+                let handle = match slot.current_handle.as_ref() {
+                    Some(h) => h.clone(),
+                    None => continue,
+                };
+                let plugin = match self.host.get_chunk(slot.provider_id) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let mut buf = vec![0u8; slot.current_size as usize];
+                rand::thread_rng().fill_bytes(&mut buf);
+                if plugin.update(&handle, &buf).await.is_ok() {
+                    self.pool.mark_erased(slot.slot_id);
+                    erased += 1;
+                }
+            }
+            Ok(erased)
+        }
+    }
+
+    #[async_trait]
+    impl Worker for SlotEraser {
+        fn name(&self) -> &'static str {
+            "slot_eraser"
+        }
+        fn interval(&self) -> Duration {
+            self.interval
+        }
+        async fn tick(&self) -> Result<()> {
+            let _ = self.erase_once().await?;
+            Ok(())
+        }
+    }
+}
+
+mod health_watcher {
+    //! ROUTING.md §13 Step 3 / §6.1 — `SupplierHealthWatcher`.
+    //!
+    //! Background loop that pulls `plugin.health()` from every
+    //! registered chunk plugin on a jittered interval and feeds the
+    //! result to `HealthMonitor`. Without this worker, `Provider.health`
+    //! is *frozen at registration time*: a backend that goes dead at
+    //! 03:00 stays at `Active` until the next user-facing put fails
+    //! against it.
+    //!
+    //! Design notes:
+    //! - Healthy reports → `record_success` (drains transient quarantine).
+    //! - Unhealthy reports → recorded as `ErrorClass::Network` so they
+    //!   integrate with the existing 10-in-60s network threshold without
+    //!   inventing a new state machine.
+    //! - Errored health calls (network failure, auth failure on a
+    //!   service like pixeldrain that tightened its policy) are
+    //!   classified by the existing `classify_error` table.
+    //!
+    //! The Layer R2 baseline (ROUTING.md §12) drives `tick()` directly
+    //! against a mock plugin that flips Healthy→Unhealthy and asserts
+    //! the engine quarantines within ~1 s without any explicit user
+    //! action.
+
+    use super::*;
+    use os_plugin_host::contract::HealthState;
+    use os_plugin_host::Host;
+
+    pub struct SupplierHealthWatcher {
+        host: Arc<Host>,
+        interval: Duration,
+    }
+
+    impl SupplierHealthWatcher {
+        pub fn new(host: Arc<Host>, interval: Duration) -> Self {
+            Self { host, interval }
+        }
+
+        /// Pure logic, testable without timers. For each registered
+        /// chunk plugin, call `health()` and record the result.
+        pub async fn poll_once(&self) -> Result<()> {
+            let providers = self.host.list_chunk();
+            for pid in providers {
+                let plugin = match self.host.get_chunk(pid) {
+                    Ok(p) => p,
+                    Err(_) => continue, // deregistered between list and get
+                };
+                match plugin.health().await {
+                    Ok(report) => match report.state {
+                        HealthState::Healthy => self.host.record_success(pid),
+                        // Both Degraded and Unhealthy feed the network
+                        // counter; thresholds in HealthMonitor decide
+                        // when this becomes a quarantine.
+                        HealthState::Degraded | HealthState::Unhealthy => {
+                            self.host.record_class(pid, os_types::ErrorClass::Network);
+                        }
+                    },
+                    Err(e) => {
+                        // Classify normally; an `AuthFailure` from
+                        // health() is just as load-bearing as one from
+                        // put().
+                        self.host.record_error(pid, &e);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Worker for SupplierHealthWatcher {
+        fn name(&self) -> &'static str {
+            "supplier_health_watcher"
+        }
+        fn interval(&self) -> Duration {
+            self.interval
+        }
+        async fn tick(&self) -> Result<()> {
+            self.poll_once().await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +553,115 @@ mod tests {
             self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
+    }
+
+    /// Layer R2 baseline (ROUTING.md §13 Step 3 / §12 R2): a mock plugin
+    /// flips `Healthy` → `Unhealthy` permanently; the
+    /// `SupplierHealthWatcher` quarantines the provider via
+    /// `HealthMonitor` without any explicit user call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_quarantines_unhealthy_provider_autonomously() {
+        use async_trait::async_trait;
+        use os_entities::{NativeHandle, PutHint};
+        use os_plugin_host::contract::{
+            DeleteResult, HealthReport, HealthState, PeekResult, PluginContract, PutResult,
+        };
+        use os_plugin_host::rate_limit::RateLimitProfile;
+        use os_plugin_host::{Host, PluginError, Result as PluginResult};
+        use os_types::{
+            BlakeHash, CachedElsewhereRisk, DeleteOutcome, HealthScore, LatencyProfile, ProviderId,
+            QuotaReclaimed, QuotaState, Range, RateLimitState, Timestamp,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering as Ord};
+
+        struct FlippingPlugin {
+            calls: AtomicU32,
+            flip_after: u32,
+        }
+        impl FlippingPlugin {
+            fn new(flip_after: u32) -> Self {
+                Self {
+                    calls: AtomicU32::new(0),
+                    flip_after,
+                }
+            }
+        }
+        #[async_trait]
+        impl PluginContract for FlippingPlugin {
+            fn rate_limit_profile(&self) -> RateLimitProfile {
+                RateLimitProfile::unbounded()
+            }
+            async fn put(&self, _: &[u8], _: &PutHint) -> PluginResult<PutResult> {
+                Err(PluginError::Plugin("not used".into()))
+            }
+            async fn get(
+                &self,
+                _: &NativeHandle,
+                _: Option<Range>,
+            ) -> PluginResult<Vec<u8>> {
+                Err(PluginError::Plugin("not used".into()))
+            }
+            async fn peek(&self, _: &NativeHandle) -> PluginResult<PeekResult> {
+                Err(PluginError::Plugin("not used".into()))
+            }
+            async fn delete(&self, _: &NativeHandle) -> PluginResult<DeleteResult> {
+                Ok(DeleteResult {
+                    outcome: DeleteOutcome::NotSupported,
+                    quota_reclaimed: QuotaReclaimed::No,
+                    cached_elsewhere_risk: CachedElsewhereRisk::Low,
+                    tombstone_clears_at: None,
+                })
+            }
+            async fn health(&self) -> PluginResult<HealthReport> {
+                let n = self.calls.fetch_add(1, Ord::SeqCst);
+                let state = if n < self.flip_after {
+                    HealthState::Healthy
+                } else {
+                    HealthState::Unhealthy
+                };
+                Ok(HealthReport {
+                    state,
+                    quota: QuotaState {
+                        total: None,
+                        used: None,
+                        untrusted: true,
+                    },
+                    rate_limit: RateLimitState {
+                        remaining: u32::MAX,
+                        reset_at: Timestamp::from_string("n/a"),
+                    },
+                    latency: LatencyProfile::default(),
+                    score: HealthScore::new(if state == HealthState::Healthy { 1.0 } else { 0.0 }),
+                })
+            }
+        }
+        // Suppress the unused-trait-import lint.
+        #[allow(dead_code)]
+        fn _bind(_: BlakeHash) {}
+
+        let host = Arc::new(Host::new());
+        let pid = ProviderId::new_v7();
+        // Register without health-recording wrap (record_unwrapped is the
+        // path Host exposes for tests / fault-injection).
+        host.register_chunk_unpaced(pid, Arc::new(FlippingPlugin::new(2)));
+
+        // Provider should start in Active.
+        assert!(host.provider_health(pid).is_active());
+
+        let watcher = SupplierHealthWatcher::new(host.clone(), Duration::from_millis(50));
+
+        // 12 ticks: first 2 healthy, next 10 unhealthy → crosses the
+        // 10-in-60s Network threshold and quarantines.
+        for _ in 0..12 {
+            watcher.poll_once().await.unwrap();
+        }
+
+        let h = host.provider_health(pid);
+        assert!(
+            !h.is_active(),
+            "provider should be quarantined after 10 consecutive Unhealthy reports; got {:?}",
+            h
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

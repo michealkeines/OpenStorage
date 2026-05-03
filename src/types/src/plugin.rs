@@ -130,6 +130,36 @@ pub enum QuotaReclaimed {
     Unknown,
 }
 
+/// What rewriting an existing handle's bytes looks like on a backend.
+/// See ROUTING.md §2.8 / §5.2.
+///
+/// Lives in `os-types` because three crates need it: `os-plugin-host`
+/// (slot pool + RateLimitProfile field), `os-placement` (eligibility
+/// gating for `MutabilityIntent`), and `os-vfs` (driving the slot path
+/// in `persist_chunk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum UpdateCapability {
+    /// Every put produces a new handle. No reuse possible.
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    /// Overwrite logically replaces the prior record but issues a new
+    /// handle. Slot pool may still rebind, but each rebind creates a
+    /// shadow against the old handle.
+    #[serde(rename = "atomic_replace")]
+    AtomicReplace,
+    /// Same URL, new bytes. Prior bytes vanish at the storage layer.
+    /// Slot pooling targets this case for shadow-free reuse.
+    #[serde(rename = "true_update")]
+    TrueUpdate,
+}
+
+impl UpdateCapability {
+    pub fn allows_reuse(self) -> bool {
+        !matches!(self, UpdateCapability::None)
+    }
+}
+
 /// Half-open byte range `[start, end)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Range {

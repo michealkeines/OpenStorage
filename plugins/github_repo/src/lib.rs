@@ -147,6 +147,13 @@ impl PluginContract for GitHubRepoPlugin {
             max_object_bytes: Some(MAX_OBJECT_BYTES),
             total_quota_bytes: Some(1024 * 1024 * 1024), // 1 GiB free repo soft cap
             detector: Arc::new(GitHubDetector),
+            // GitHub commit-on-existing-path is structurally TrueUpdate
+            // (same URL, new bytes), but the plugin's `update()` method
+            // is not yet wired. Declaring `None` here keeps the slot
+            // pool from attempting it; a follow-up that implements
+            // `update()` should bump this to `TrueUpdate`.
+            update_capability: os_plugin_host::UpdateCapability::None,
+            daily_op_budget: None,
         }
     }
 

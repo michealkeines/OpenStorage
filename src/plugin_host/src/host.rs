@@ -22,6 +22,16 @@ pub struct Host {
     /// `RecordingVaultPlugin` wrappers can feed the same classifier
     /// without holding a back-reference to the whole `Host`.
     health: Arc<HealthMonitor>,
+    /// Per-(provider, op) circuit breaker. Complements `health` for
+    /// fast per-call gating. ROUTING.md §6.2.
+    breaker: Arc<crate::CircuitBreaker>,
+    /// Per-provider self-throttling against operator ToS budgets.
+    /// ROUTING.md §6.3.
+    abuse: Arc<crate::AbuseSensor>,
+    /// Per-(provider, op) capability drift. ROUTING.md §6.4.
+    drift: Arc<crate::CapabilityDriftDetector>,
+    /// Per-provider observed idempotency violations. ROUTING.md §6.5.
+    idempotency: Arc<crate::IdempotencyTracker>,
 }
 
 #[derive(Clone)]
@@ -40,7 +50,37 @@ impl Host {
             chunk_plugins: RwLock::new(HashMap::new()),
             vault_plugins: RwLock::new(HashMap::new()),
             health: Arc::new(HealthMonitor::default()),
+            breaker: Arc::new(crate::CircuitBreaker::default()),
+            abuse: Arc::new(crate::AbuseSensor::default()),
+            drift: Arc::new(crate::CapabilityDriftDetector::default()),
+            idempotency: Arc::new(crate::IdempotencyTracker::default()),
         }
+    }
+
+    /// Shared circuit breaker handle. The dispatcher consults it to
+    /// skip currently-Open candidates; the recording wrapper feeds it
+    /// every op outcome.
+    pub fn circuit_breaker(&self) -> Arc<crate::CircuitBreaker> {
+        self.breaker.clone()
+    }
+
+    /// Shared abuse-sensor handle. `vault::current_pool` filters
+    /// providers reported as `is_over_budget`; the recording wrapper
+    /// ticks the sensor on each successful op.
+    pub fn abuse_sensor(&self) -> Arc<crate::AbuseSensor> {
+        self.abuse.clone()
+    }
+
+    /// Shared capability-drift detector. The recording wrapper feeds
+    /// it; vfs / dispatcher consult `is_observed_unsupported` before
+    /// issuing ops that previously came back NotSupported.
+    pub fn capability_drift(&self) -> Arc<crate::CapabilityDriftDetector> {
+        self.drift.clone()
+    }
+
+    /// Shared idempotency tracker.
+    pub fn idempotency_tracker(&self) -> Arc<crate::IdempotencyTracker> {
+        self.idempotency.clone()
     }
 
     // ── Layer 2 — provider-health surface ────────────────────────────────
@@ -127,6 +167,9 @@ impl Host {
         let profile = plugin.rate_limit_profile();
         let cfg = RateLimitConfig::from_profile(&profile, &policy);
         let label = format!("chunk:{}:{}", profile.label, id);
+        // ROUTING.md §6.3 — capture the plugin-declared daily budget
+        // so the abuse sensor knows the cap up front.
+        self.abuse.set_budget(id, profile.daily_op_budget);
         let mw = Arc::new(RateLimitMiddleware::new(plugin, cfg).with_label(label));
         // Outer wrapper auto-records every put/get/peek/delete to the
         // shared `HealthMonitor` (Layer 2 closure).
@@ -134,6 +177,9 @@ impl Host {
             crate::recording::RecordingChunkPlugin::new(
                 mw.clone(),
                 self.health.clone(),
+                self.breaker.clone(),
+                self.abuse.clone(),
+                self.drift.clone(),
                 id,
             ),
         );
@@ -149,8 +195,18 @@ impl Host {
     /// Register without any pacing. Test fixtures only — production paths
     /// always go through `register_chunk` so profiles are honored.
     pub fn register_chunk_unpaced(&self, id: ProviderId, plugin: Arc<dyn PluginContract>) {
+        // Capture budget like the paced path (cheap; reads the live
+        // profile once).
+        self.abuse.set_budget(id, plugin.rate_limit_profile().daily_op_budget);
         let wrapped: Arc<dyn PluginContract> = Arc::new(
-            crate::recording::RecordingChunkPlugin::new(plugin, self.health.clone(), id),
+            crate::recording::RecordingChunkPlugin::new(
+                plugin,
+                self.health.clone(),
+                self.breaker.clone(),
+                self.abuse.clone(),
+                self.drift.clone(),
+                id,
+            ),
         );
         self.chunk_plugins.write().expect("host registry").insert(
             id,
@@ -170,6 +226,8 @@ impl Host {
         plugin: Arc<dyn PluginContract>,
         cfg: RateLimitConfig,
     ) {
+        // Capture budget from the live profile.
+        self.abuse.set_budget(id, plugin.rate_limit_profile().daily_op_budget);
         let mw = Arc::new(
             RateLimitMiddleware::new(plugin, cfg).with_label(format!("chunk:{id}")),
         );
@@ -177,6 +235,9 @@ impl Host {
             crate::recording::RecordingChunkPlugin::new(
                 mw.clone(),
                 self.health.clone(),
+                self.breaker.clone(),
+                self.abuse.clone(),
+                self.drift.clone(),
                 id,
             ),
         );
@@ -206,6 +267,23 @@ impl Host {
             .get(&id)
             .map(|e| e.plugin.clone())
             .ok_or_else(|| PluginError::NotFound(format!("chunk plugin {id}")))
+    }
+
+    /// Returns the live `RateLimitProfile` declared by a registered chunk
+    /// plugin, or `None` if no plugin is registered under that id.
+    /// Used by `os-vault::current_pool` to enrich the placement snapshot
+    /// with host-side fields like `max_object_bytes`. ROUTING.md §13 Step 2.
+    pub fn rate_limit_profile_for(
+        &self,
+        id: ProviderId,
+    ) -> Option<crate::RateLimitProfile> {
+        let plugin = self
+            .chunk_plugins
+            .read()
+            .expect("host registry")
+            .get(&id)
+            .map(|e| e.plugin.clone())?;
+        Some(plugin.rate_limit_profile())
     }
 
     /// Returns the middleware wrapping `id`, if any. The dispatcher uses

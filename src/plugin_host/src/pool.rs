@@ -98,6 +98,7 @@ impl PoolDispatcher {
             return Err(PluginError::Plugin("no candidates".into()));
         }
         let ranked = Self::rank(host, Op::Put, candidates).await;
+        let breaker = host.circuit_breaker();
         let mut attempts = 0u32;
         let mut skipped = 0u32;
         let mut last_err: Option<PluginError> = None;
@@ -108,6 +109,13 @@ impl PoolDispatcher {
                     skipped += 1;
                     continue;
                 }
+            }
+            // ROUTING.md §6.2 — skip candidates whose Put circuit is
+            // currently Open. HalfOpen passes through (the call itself
+            // is the probe).
+            if !breaker.permits(rc.provider_id, Op::Put).permits_now() {
+                skipped += 1;
+                continue;
             }
             let plugin = match host.get_chunk(rc.provider_id) {
                 Ok(p) => p,
@@ -159,6 +167,7 @@ impl PoolDispatcher {
         }
         let ids: Vec<ProviderId> = candidates.iter().map(|(p, _)| *p).collect();
         let ranked = Self::rank(host, Op::Get, &ids).await;
+        let breaker = host.circuit_breaker();
         let mut attempts = 0u32;
         let mut skipped = 0u32;
         let mut last_err: Option<PluginError> = None;
@@ -169,6 +178,11 @@ impl PoolDispatcher {
                     skipped += 1;
                     continue;
                 }
+            }
+            // ROUTING.md §6.2 — skip candidates whose Get circuit is Open.
+            if !breaker.permits(rc.provider_id, Op::Get).permits_now() {
+                skipped += 1;
+                continue;
             }
             let handle = match candidates.iter().find(|(p, _)| *p == rc.provider_id) {
                 Some((_, h)) => h.clone(),
@@ -398,6 +412,56 @@ mod tests {
         .unwrap();
         assert_eq!(r.attempts, 1);
         assert_eq!(r.provider_id, id);
+    }
+
+    /// ROUTING.md §13 Step 9 — the dispatcher consults the circuit
+    /// breaker per candidate and skips any provider whose Put circuit
+    /// is currently Open. With the Open candidate first, the
+    /// dispatcher must reroute to the second.
+    #[tokio::test]
+    async fn put_dispatcher_skips_open_candidates() {
+        use crate::CircuitState;
+        let host = Host::new();
+        let breaker = host.circuit_breaker();
+        let cfg = RateLimitConfig::unbounded();
+        let primary = Capped::new("primary", 1000);
+        let secondary = Capped::new("secondary", 1000);
+        let id_primary = ProviderId::new_v7();
+        let id_secondary = ProviderId::new_v7();
+        host.register_chunk_with_config(id_primary, primary.clone(), cfg.clone());
+        host.register_chunk_with_config(id_secondary, secondary.clone(), cfg);
+
+        // Force primary's Put circuit Open by recording 5 failures (the
+        // default failure_threshold).
+        for _ in 0..5 {
+            breaker.record_failure(id_primary, Op::Put);
+        }
+        match breaker.permits(id_primary, Op::Put) {
+            CircuitState::Open { .. } => {}
+            other => panic!("expected primary Open, got {other:?}"),
+        }
+        // Secondary is still Closed.
+        assert_eq!(breaker.permits(id_secondary, Op::Put), CircuitState::Closed);
+
+        // Dispatch with primary listed first; primary should be skipped.
+        let r = PoolDispatcher::put_with_fallback(
+            &host,
+            &[id_primary, id_secondary],
+            b"x",
+            &PutHint::default(),
+            DispatcherConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.provider_id, id_secondary, "should skip Open primary");
+        assert!(
+            r.skipped >= 1,
+            "skip count should reflect Open primary; got {}",
+            r.skipped
+        );
+        // Primary's plugin should not have been invoked.
+        assert_eq!(primary.served.load(Ordering::SeqCst), 0);
+        assert_eq!(secondary.served.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

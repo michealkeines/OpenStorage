@@ -67,6 +67,30 @@ pub trait PluginContract: Send + Sync {
     async fn delete(&self, handle: &NativeHandle) -> Result<DeleteResult>;
     async fn health(&self) -> Result<HealthReport>;
 
+    /// Overwrite an existing handle's bytes in place. The default returns
+    /// `NotSupported` so plugins opt in by overriding. The slot pool
+    /// (ROUTING.md §5) calls this to reuse a slot's storage instead of
+    /// allocating a fresh handle every write.
+    ///
+    /// Two contracts the implementation must obey:
+    ///
+    /// - `TrueUpdate` providers (S3, GitHub, R2, …): the returned
+    ///   `PutResult.handle` MUST byte-equal `handle`, and
+    ///   `handle_changed` MUST be `false`.
+    /// - `AtomicReplace` providers: the returned handle MAY differ; the
+    ///   plugin SHOULD set `prior_handle_state = Some(Removed)` so the
+    ///   slot pool downgrades to a non-reusable record.
+    ///
+    /// Implementations that don't support either form return
+    /// `PluginError::NotSupported`. The slot pool reads this and falls
+    /// back to a fresh `put`.
+    async fn update(&self, handle: &NativeHandle, payload: &[u8]) -> Result<PutResult> {
+        let _ = (handle, payload);
+        Err(crate::PluginError::NotSupported(
+            "this plugin does not implement update; falling back to put".into(),
+        ))
+    }
+
     /// **Self-described rate-limit profile.** The plugin tells the host
     /// everything it knows about its backend's limits — per-op rates,
     /// concurrency, max object size, total quota, and how to recognize a

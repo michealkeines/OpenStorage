@@ -94,6 +94,8 @@ impl PluginContract for FilebinPlugin {
             max_object_bytes: Some(MAX_OBJECT_BYTES),
             total_quota_bytes: Some(MAX_OBJECT_BYTES),
             detector: Arc::new(os_plugin_host::http::DefaultDetector),
+            update_capability: os_plugin_host::UpdateCapability::None,
+            daily_op_budget: None,
         }
     }
 

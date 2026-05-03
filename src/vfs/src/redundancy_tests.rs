@@ -52,6 +52,12 @@ pub struct MockPlugin {
     pub forget_data: AtomicBool,
     pub put_count: AtomicU32,
     pub get_count: AtomicU32,
+    /// When true, the plugin advertises `UpdateCapability::TrueUpdate`
+    /// in its rate-limit profile and the `update` trait method is
+    /// implemented in-place (same handle, new bytes). Toggle in tests
+    /// that exercise the slot pool.
+    pub update_capable: AtomicBool,
+    pub update_count: AtomicU32,
 }
 
 impl MockPlugin {
@@ -65,6 +71,8 @@ impl MockPlugin {
             forget_data: AtomicBool::new(false),
             put_count: AtomicU32::new(0),
             get_count: AtomicU32::new(0),
+            update_capable: AtomicBool::new(false),
+            update_count: AtomicU32::new(0),
         })
     }
 
@@ -75,6 +83,38 @@ impl MockPlugin {
 
 #[async_trait]
 impl PluginContract for MockPlugin {
+    fn rate_limit_profile(&self) -> os_plugin_host::rate_limit::RateLimitProfile {
+        let mut p = os_plugin_host::rate_limit::RateLimitProfile::unbounded();
+        if self.update_capable.load(Ordering::SeqCst) {
+            p.update_capability = os_types::UpdateCapability::TrueUpdate;
+        }
+        p
+    }
+
+    async fn update(
+        &self,
+        handle: &NativeHandle,
+        payload: &[u8],
+    ) -> PluginResult<PutResult> {
+        if !self.update_capable.load(Ordering::SeqCst) {
+            return Err(PluginError::NotSupported("not update_capable".into()));
+        }
+        self.update_count.fetch_add(1, Ordering::SeqCst);
+        // True in-place update: store at the same handle key.
+        self.storage
+            .lock()
+            .unwrap()
+            .insert(handle.0.clone(), payload.to_vec());
+        Ok(PutResult {
+            handle: handle.clone(),
+            handle_changed: false,
+            prior_handle_state: Some(os_types::PriorHandleState::Overwritten),
+            stored_at: Timestamp::from_string("mock-update"),
+            quota_reclaimed: QuotaReclaimed::Unknown,
+            tombstone_clears_at: None,
+        })
+    }
+
     async fn put(&self, payload: &[u8], _hint: &PutHint) -> PluginResult<PutResult> {
         self.put_count.fetch_add(1, Ordering::SeqCst);
         if self.rate_limited.load(Ordering::SeqCst) {
@@ -172,6 +212,7 @@ pub struct Fixture {
     pub svc: Arc<VfsService>,
     pub providers: Vec<(ProviderId, Arc<MockPlugin>)>,
     pub store: Arc<Store>,
+    pub host: Arc<Host>,
 }
 
 pub fn fixture(n_groups: usize, k_target: u8, chunk_bytes: usize) -> Fixture {
@@ -234,7 +275,7 @@ pub fn fixture(n_groups: usize, k_target: u8, chunk_bytes: usize) -> Fixture {
         store.clone(),
         vault,
         sync,
-        host,
+        host.clone(),
         VfsConfig {
             inline_threshold_bytes: 64,
             chunk_bytes,
@@ -252,6 +293,7 @@ pub fn fixture(n_groups: usize, k_target: u8, chunk_bytes: usize) -> Fixture {
         svc,
         providers,
         store,
+        host,
     }
 }
 
@@ -579,4 +621,254 @@ async fn mid_read_provider_failure_handled() {
         got.extend_from_slice(&c.unwrap());
     }
     assert_eq!(got, payload);
+}
+
+// ─── Slot-pool tests (ROUTING.md §13 Step 7b) ─────────────────────────────
+
+/// Layer R5 baseline (CLI-integration version — ROUTING.md §12 R5).
+///
+/// All providers declare `TrueUpdate`. Write file A → all shards land
+/// fresh. Delete file A → engine releases each shard's slot. Write
+/// file B with the same size class → engine consults the slot pool,
+/// finds a Forgotten slot per shard, and dispatches via `update()`
+/// (preserving handles) instead of allocating fresh handles.
+///
+/// Pin: after the second write, the cumulative `put_count` across all
+/// providers is exactly the count from the FIRST write (no fresh puts
+/// for B), and `update_count` equals B's shard count.
+#[tokio::test]
+async fn slot_pool_reuses_forgotten_slots_after_delete() {
+    let f = fixture(3, 1, 4096);
+    for (_pid, plugin) in &f.providers {
+        plugin.update_capable.store(true, Ordering::SeqCst);
+    }
+
+    let payload_a = vec![0xAAu8; 1024];
+    f.svc.write("/a", &payload_a).await.unwrap();
+    let put_after_a: u32 = f
+        .providers
+        .iter()
+        .map(|(_, p)| p.put_count.load(Ordering::SeqCst))
+        .sum();
+    let update_after_a: u32 = f
+        .providers
+        .iter()
+        .map(|(_, p)| p.update_count.load(Ordering::SeqCst))
+        .sum();
+    assert_eq!(
+        update_after_a, 0,
+        "first write should not invoke update; got {update_after_a}"
+    );
+    assert!(put_after_a > 0, "first write should have called put");
+
+    f.svc.delete("/a").unwrap();
+
+    let payload_b = vec![0xBBu8; 1024];
+    f.svc.write("/b", &payload_b).await.unwrap();
+    let put_after_b: u32 = f
+        .providers
+        .iter()
+        .map(|(_, p)| p.put_count.load(Ordering::SeqCst))
+        .sum();
+    let update_after_b: u32 = f
+        .providers
+        .iter()
+        .map(|(_, p)| p.update_count.load(Ordering::SeqCst))
+        .sum();
+    assert_eq!(
+        put_after_b, put_after_a,
+        "second write should have reused all slots via update; \
+         put_count grew from {put_after_a} to {put_after_b}"
+    );
+    assert!(
+        update_after_b >= 1,
+        "second write should have invoked update at least once; \
+         update_count={update_after_b}"
+    );
+
+    // And the file is readable — slot reuse preserved data integrity.
+    let read_b = f.svc.read("/b").await.unwrap();
+    assert_eq!(read_b, payload_b);
+}
+
+/// Layer R6 baseline (CLI-integration version — ROUTING.md §12 R6).
+///
+/// On a `TrueUpdate`-capable backend that *can't honestly delete*,
+/// crypto-erasure preserves I5 (no silent leaks) by overwriting the
+/// slot's bytes with random noise after the chunk key is dropped.
+///
+/// Pin: write a chunk; capture the ciphertext at rest in the mock's
+/// storage; delete the file; run `erase_pending_slots`; assert the
+/// mock's storage at the same handle now holds *different* bytes
+/// (random noise, not the original AEAD-tagged ciphertext) AND that
+/// the slot's state has transitioned to `Empty`. The mock's `delete`
+/// is never invoked — erasure rides the `update` path.
+#[tokio::test]
+async fn slot_pool_crypto_erases_after_delete() {
+    use os_plugin_host::SlotState;
+
+    let f = fixture(1, 1, 4096);
+    let (pid, plugin) = f.providers[0].clone();
+    plugin.update_capable.store(true, Ordering::SeqCst);
+
+    let payload = vec![0xAAu8; 1024];
+    f.svc.write("/a", &payload).await.unwrap();
+
+    // Capture the post-write ciphertext: pull the only Filled slot and
+    // read its bytes from the mock's in-memory storage.
+    let pool = f.svc.slot_pool();
+    let pre_handle: NativeHandle = {
+        let inner_handle = pool
+            .pending_erasure() // empty — nothing released yet
+            .into_iter()
+            .next()
+            .map(|s| s.current_handle.clone().unwrap());
+        // `pending_erasure` is empty pre-delete. Iterate slots via len.
+        assert_eq!(inner_handle, None, "no Forgotten slots before delete");
+        // Find the slot via slot_for_handle reverse lookup: scan every
+        // stored handle in the mock and check the slot pool for it.
+        let storage = plugin.storage.lock().unwrap();
+        let h_bytes = storage.keys().next().expect("mock stored one chunk").clone();
+        drop(storage);
+        NativeHandle(h_bytes)
+    };
+    let pre_bytes = plugin
+        .storage
+        .lock()
+        .unwrap()
+        .get(&pre_handle.0)
+        .cloned()
+        .expect("pre-delete bytes present");
+    let slot_id = pool
+        .slot_for_handle(pid, &pre_handle)
+        .expect("slot tracked");
+
+    // Delete the file. This registers a shadow AND releases the slot,
+    // but does *not* erase yet — erasure is its own pass.
+    f.svc.delete("/a").unwrap();
+    assert_eq!(
+        pool.get(slot_id).unwrap().state,
+        SlotState::Forgotten,
+        "slot should be Forgotten after delete, before erasure"
+    );
+    let bytes_post_delete_pre_erase = plugin
+        .storage
+        .lock()
+        .unwrap()
+        .get(&pre_handle.0)
+        .cloned()
+        .expect("bytes still on backend");
+    assert_eq!(
+        bytes_post_delete_pre_erase, pre_bytes,
+        "delete alone must not change bytes-at-rest (no Delete capability)"
+    );
+
+    // Run the erasure pass.
+    let erased = f.svc.erase_pending_slots().await.unwrap();
+    assert_eq!(erased, 1, "exactly one Forgotten slot should be erased");
+
+    // Bytes-at-rest must now differ from the original ciphertext, and
+    // the slot must be Empty.
+    let post_bytes = plugin
+        .storage
+        .lock()
+        .unwrap()
+        .get(&pre_handle.0)
+        .cloned()
+        .expect("handle still occupies storage");
+    assert_eq!(
+        post_bytes.len(),
+        pre_bytes.len(),
+        "size class is preserved across erasure"
+    );
+    assert_ne!(
+        post_bytes, pre_bytes,
+        "bytes-at-rest must be overwritten by random noise"
+    );
+    assert_eq!(pool.get(slot_id).unwrap().state, SlotState::Empty);
+}
+
+/// Layer R7 baseline (CLI-integration version — ROUTING.md §12 R7).
+///
+/// `AbuseSensor` filters over-budget providers out of placement before
+/// the dispatcher even sees them. With provider 0's daily budget set
+/// to zero (effectively immediately over budget), every chunk write
+/// must route to provider 1 — provider 0's plugin is never called.
+#[tokio::test]
+async fn abuse_sensor_filters_over_budget_providers() {
+    let f = fixture(2, 1, 4096);
+    let host_abuse = f.providers[0].0; // provider id
+    f.host
+        .abuse_sensor()
+        .set_budget(host_abuse, Some(0));
+
+    // Three independent files exercise three independent placements.
+    for i in 0..3 {
+        let path = format!("/abuse-{i}");
+        f.svc.write(&path, &vec![0xCDu8; 1024]).await.unwrap();
+    }
+
+    let p0 = f.providers[0].1.put_count.load(Ordering::SeqCst);
+    let p1 = f.providers[1].1.put_count.load(Ordering::SeqCst);
+    assert_eq!(
+        p0, 0,
+        "provider 0 should never be picked while over budget; got {p0} puts"
+    );
+    assert!(
+        p1 >= 3,
+        "provider 1 should absorb every write; got {p1} puts"
+    );
+}
+
+/// And once the budget loosens, the provider becomes eligible again.
+#[tokio::test]
+async fn abuse_sensor_re_admits_provider_after_budget_loosens() {
+    let f = fixture(2, 1, 4096);
+    let pid0 = f.providers[0].0;
+    let host = f.host;
+    let abuse = host.abuse_sensor();
+
+    abuse.set_budget(pid0, Some(0));
+    f.svc.write("/before", &vec![0xAAu8; 1024]).await.unwrap();
+    let p0_before = f.providers[0].1.put_count.load(Ordering::SeqCst);
+    assert_eq!(p0_before, 0);
+
+    // Loosen.
+    abuse.set_budget(pid0, None);
+    // Write enough chunks that placement statistically reaches both.
+    for i in 0..6 {
+        f.svc
+            .write(&format!("/after-{i}"), &vec![0xBBu8; 1024])
+            .await
+            .unwrap();
+    }
+    let p0_after = f.providers[0].1.put_count.load(Ordering::SeqCst);
+    assert!(
+        p0_after >= 1,
+        "provider 0 should be re-admitted once budget cleared; got {p0_after} puts"
+    );
+}
+
+/// Negative case: providers that DON'T declare update_capable get the
+/// existing fresh-put behavior. The slot pool exists but never fires.
+#[tokio::test]
+async fn slot_pool_skips_non_update_capable_providers() {
+    let f = fixture(3, 1, 4096);
+    // Leave update_capable=false on every plugin.
+
+    let payload_a = vec![0x11u8; 1024];
+    f.svc.write("/a", &payload_a).await.unwrap();
+    f.svc.delete("/a").unwrap();
+    let payload_b = vec![0x22u8; 1024];
+    f.svc.write("/b", &payload_b).await.unwrap();
+
+    let total_updates: u32 = f
+        .providers
+        .iter()
+        .map(|(_, p)| p.update_count.load(Ordering::SeqCst))
+        .sum();
+    assert_eq!(
+        total_updates, 0,
+        "no provider declared update_capable; update should never be called"
+    );
 }

@@ -1,21 +1,28 @@
-//! `os-plugin-catbox` — `catbox.moe`, the original anonymous file host.
+//! `os-plugin-pomf-clone` — parameterized plugin for any pomf-protocol host.
 //!
-//! Endpoint: POST `https://catbox.moe/user/api.php` with multipart form
-//! `reqtype=fileupload` + `fileToUpload=@<bytes>`. Response is the file URL
-//! in plain text (e.g. `https://files.catbox.moe/abc.bin`).
+//! Pomf is a small open-source upload server with many independent public
+//! deployments. They all share the same wire shape:
 //!
-//! Optional second flow: `userhash` lets a logged-in user manage their
-//! files — out of scope here. Anonymous mode is the storage path.
+//! - `POST {base}/upload.php` (sometimes `{base}/upload`) with multipart
+//!   form, field name `files[]`. The form may include any number of files;
+//!   we always send one.
+//! - Response: JSON `{"success":true,"files":[{"url":"...","hash":"...",
+//!   "size":N}]}`.
 //!
-//! Limits:
-//! - 200 MiB per file (operator-published)
-//! - **Persistent** (no TTL, unlike litterbox.catbox.moe)
-//! - No published per-IP rate limit; we configure conservative.
-//! - Deletion requires `userhash` (auth). Anonymous puts cannot be deleted
-//!   later, so we surface `DeleteOutcome::NotSupported` and the engine
-//!   registers a Shadow with reason `DeletionOrphaned`.
+//! Each instance is a distinct operator with its own retention, quota, and
+//! egress IP — exactly what you want for trust-group diversity. Register
+//! one provider per instance in `providers.json`:
 //!
-//! Privacy: ciphertext only.
+//! ```json
+//! [
+//!   {"kind":"pomf","label":"lain","base":"https://pomf.lain.la","trust_group":"pomf-lain"},
+//!   {"kind":"pomf","label":"safe","base":"https://safe.fiery.me","trust_group":"pomf-safe"},
+//!   {"kind":"pomf","label":"kek","base":"https://kek.sh","upload_path":"/upload","trust_group":"pomf-kek"}
+//! ]
+//! ```
+//!
+//! Privacy: ciphertext only. Deletion: not exposed by the public pomf API,
+//! so `DeleteOutcome::NotSupported`.
 
 #![forbid(unsafe_code)]
 
@@ -35,44 +42,70 @@ use os_types::{
     QuotaReclaimed, QuotaState, Range, RateLimitState, Timestamp,
 };
 use reqwest::multipart;
+use serde::Deserialize;
 
-const UPLOAD_ENDPOINT: &str = "https://catbox.moe/user/api.php";
-const MAX_OBJECT_BYTES: u64 = 200 * 1024 * 1024;
+const DEFAULT_UPLOAD_PATH: &str = "/upload.php";
+const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
-pub struct CatboxPlugin {
+pub struct PomfClonePlugin {
+    base: String,
+    upload_url: String,
+    label: String,
     http: HttpClient,
+    cap: u64,
 }
 
-impl CatboxPlugin {
-    pub fn new() -> Self {
+impl PomfClonePlugin {
+    /// `base` is the operator origin (e.g. `https://pomf.lain.la`).
+    /// `upload_path` defaults to `/upload.php` if `None`.
+    pub fn new(base: impl Into<String>, upload_path: Option<&str>, label: impl Into<String>) -> Self {
+        let base = base.into().trim_end_matches('/').to_string();
+        let upload_url = format!("{base}{}", upload_path.unwrap_or(DEFAULT_UPLOAD_PATH));
+        let label = label.into();
         let cfg = HttpClientConfig {
-            user_agent: "openstorage-catbox/0.1".into(),
+            user_agent: format!("openstorage-pomf/0.1 ({label})"),
             ..Default::default()
         };
         Self {
+            base,
+            upload_url,
+            label,
             http: HttpClient::new(cfg),
+            cap: MAX_OBJECT_BYTES,
         }
+    }
+
+    pub fn with_max_object_bytes(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
     }
 }
 
-impl Default for CatboxPlugin {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Deserialize)]
+struct PomfResp {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    files: Vec<PomfFile>,
+}
+
+#[derive(Deserialize)]
+struct PomfFile {
+    url: String,
 }
 
 #[async_trait]
-impl PluginContract for CatboxPlugin {
+impl PluginContract for PomfClonePlugin {
     fn rate_limit_profile(&self) -> RateLimitProfile {
         RateLimitProfile {
-            label: "catbox.moe".into(),
+            label: format!("pomf:{}", self.label),
             puts: RateBucket::new(0.5, 2),
             gets: RateBucket::new(4.0, 8),
             peeks: RateBucket::new(4.0, 8),
             deletes: RateBucket::new(0.5, 1),
             max_concurrent: 2,
-            max_object_bytes: Some(MAX_OBJECT_BYTES),
+            max_object_bytes: Some(self.cap),
             total_quota_bytes: None,
             detector: Arc::new(os_plugin_host::http::DefaultDetector),
             update_capability: os_plugin_host::UpdateCapability::None,
@@ -81,33 +114,36 @@ impl PluginContract for CatboxPlugin {
     }
 
     async fn put(&self, payload: &[u8], _hint: &PutHint) -> PluginResult<PutResult> {
-        if payload.len() as u64 > MAX_OBJECT_BYTES {
+        if payload.len() as u64 > self.cap {
             return Err(PluginError::Plugin(format!(
-                "payload {} exceeds catbox cap {}",
+                "payload {} exceeds pomf cap {}",
                 payload.len(),
-                MAX_OBJECT_BYTES
+                self.cap
             )));
         }
         let part = multipart::Part::bytes(payload.to_vec())
             .file_name("blob.bin")
             .mime_str("application/octet-stream")
             .map_err(|e| PluginError::Plugin(format!("multipart: {e}")))?;
-        let form = multipart::Form::new()
-            .text("reqtype", "fileupload")
-            .part("fileToUpload", part);
-        let resp = self.http.post_multipart(UPLOAD_ENDPOINT, form).await?;
-        let url = std::str::from_utf8(&resp.body)
-            .map_err(|_| PluginError::Plugin("non-utf8 response".into()))?
-            .trim()
-            .to_string();
-        if !(url.starts_with("https://files.catbox.moe/") || url.starts_with("https://catbox.moe/")) {
-            return Err(PluginError::Plugin(format!("bad response: {url}")));
+        let form = multipart::Form::new().part("files[]", part);
+        let resp = self.http.post_multipart(&self.upload_url, form).await?;
+        let parsed: PomfResp = resp.json()?;
+        if !parsed.success {
+            return Err(PluginError::Plugin(format!(
+                "pomf {}: success=false",
+                self.label
+            )));
         }
+        let f = parsed
+            .files
+            .into_iter()
+            .next()
+            .ok_or_else(|| PluginError::Plugin(format!("pomf {}: empty files[]", self.label)))?;
         Ok(PutResult {
-            handle: NativeHandle(url.into_bytes()),
+            handle: NativeHandle(f.url.into_bytes()),
             handle_changed: true,
             prior_handle_state: None,
-            stored_at: Timestamp::from_string("catbox"),
+            stored_at: Timestamp::from_string("pomf"),
             quota_reclaimed: QuotaReclaimed::Unknown,
             tombstone_clears_at: None,
         })
@@ -133,13 +169,13 @@ impl PluginContract for CatboxPlugin {
                     .header_str("content-length")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0),
-                mtime: Timestamp::from_string("catbox"),
+                mtime: Timestamp::from_string("pomf"),
                 etag: None,
             }),
             Err(PluginError::Plugin(m)) if m.contains("not found") => Ok(PeekResult {
                 exists: false,
                 size: 0,
-                mtime: Timestamp::from_string("catbox"),
+                mtime: Timestamp::from_string("pomf"),
                 etag: None,
             }),
             Err(e) => Err(e),
@@ -147,9 +183,6 @@ impl PluginContract for CatboxPlugin {
     }
 
     async fn delete(&self, _handle: &NativeHandle) -> PluginResult<DeleteResult> {
-        // Anonymous catbox puts have no delete API; the file persists until
-        // the operator garbage-collects abandoned content. Engine treats as
-        // Tombstoned and registers a Shadow.
         Ok(DeleteResult {
             outcome: DeleteOutcome::NotSupported,
             quota_reclaimed: QuotaReclaimed::No,
@@ -159,8 +192,9 @@ impl PluginContract for CatboxPlugin {
     }
 
     async fn health(&self) -> PluginResult<HealthReport> {
-        let state = match self.http.head("https://catbox.moe/").await {
+        let state = match self.http.head(&self.base).await {
             Ok(_) => HealthState::Healthy,
+            Err(PluginError::Plugin(msg)) if msg.contains("405") => HealthState::Healthy,
             _ => HealthState::Unhealthy,
         };
         Ok(HealthReport {
@@ -191,13 +225,11 @@ fn _bind_etag(_: BlakeHash) {}
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore]
-    async fn live_round_trip() {
-        let p = CatboxPlugin::new();
-        let payload: Vec<u8> = (0u8..=255).cycle().take(64 * 1024).collect();
-        let r = p.put(&payload, &PutHint::default()).await.unwrap();
-        let got = p.get(&r.handle, None).await.unwrap();
-        assert_eq!(got, payload);
+    #[test]
+    fn upload_url_is_assembled_from_base_and_path() {
+        let p = PomfClonePlugin::new("https://pomf.lain.la", None, "lain");
+        assert_eq!(p.upload_url, "https://pomf.lain.la/upload.php");
+        let p = PomfClonePlugin::new("https://kek.sh/", Some("/upload"), "kek");
+        assert_eq!(p.upload_url, "https://kek.sh/upload");
     }
 }

@@ -1487,6 +1487,7 @@ dependencies = [
  "os-lease",
  "os-metadata",
  "os-placement",
+ "os-plugin-bashupload",
  "os-plugin-catbox",
  "os-plugin-discord",
  "os-plugin-fault-inject",
@@ -1494,9 +1495,15 @@ dependencies = [
  "os-plugin-github-repo",
  "os-plugin-host",
  "os-plugin-http-backend",
+ "os-plugin-litterbox",
+ "os-plugin-oshi",
  "os-plugin-paste-rs",
+ "os-plugin-pixeldrain",
+ "os-plugin-pomf-clone",
  "os-plugin-telegram",
  "os-plugin-telegraph",
+ "os-plugin-temp-sh",
+ "os-plugin-x0clone",
  "os-plugin-zeroxst",
  "os-recovery",
  "os-repair",
@@ -1776,6 +1783,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-plugin-bashupload"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
 name = "os-plugin-catbox"
 version = "0.1.0"
 dependencies = [
@@ -1884,6 +1903,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-plugin-litterbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
+name = "os-plugin-oshi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
 name = "os-plugin-paste-rs"
 version = "0.1.0"
 dependencies = [
@@ -1893,6 +1936,32 @@ dependencies = [
  "os-plugin-host",
  "os-types",
  "reqwest",
+ "tokio",
+]
+
+[[package]]
+name = "os-plugin-pixeldrain"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "os-plugin-pomf-clone"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "serde",
  "tokio",
 ]
 
@@ -1921,6 +1990,30 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "os-plugin-temp-sh"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
+name = "os-plugin-x0clone"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "os-entities",
+ "os-plugin-host",
+ "os-types",
+ "reqwest",
  "tokio",
 ]
 

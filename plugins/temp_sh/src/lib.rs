@@ -1,19 +1,12 @@
-//! `os-plugin-catbox` — `catbox.moe`, the original anonymous file host.
+//! `os-plugin-temp-sh` — `temp.sh`, large-file curl-friendly host.
 //!
-//! Endpoint: POST `https://catbox.moe/user/api.php` with multipart form
-//! `reqtype=fileupload` + `fileToUpload=@<bytes>`. Response is the file URL
-//! in plain text (e.g. `https://files.catbox.moe/abc.bin`).
-//!
-//! Optional second flow: `userhash` lets a logged-in user manage their
-//! files — out of scope here. Anonymous mode is the storage path.
+//! Endpoint: `PUT https://temp.sh/upload/<name>` with raw body. Response
+//! body is the plain-text URL `https://temp.sh/<id>/<name>`.
 //!
 //! Limits:
-//! - 200 MiB per file (operator-published)
-//! - **Persistent** (no TTL, unlike litterbox.catbox.moe)
-//! - No published per-IP rate limit; we configure conservative.
-//! - Deletion requires `userhash` (auth). Anonymous puts cannot be deleted
-//!   later, so we surface `DeleteOutcome::NotSupported` and the engine
-//!   registers a Shadow with reason `DeletionOrphaned`.
+//! - 4 GiB per file (operator-published; we cap at 1 GiB to bound memory).
+//! - 3-day retention, no auth.
+//! - No deletion API. `DeleteOutcome::NotSupported`.
 //!
 //! Privacy: ciphertext only.
 
@@ -34,20 +27,19 @@ use os_types::{
     BlakeHash, CachedElsewhereRisk, DeleteOutcome, HealthScore, LatencyProfile,
     QuotaReclaimed, QuotaState, Range, RateLimitState, Timestamp,
 };
-use reqwest::multipart;
 
-const UPLOAD_ENDPOINT: &str = "https://catbox.moe/user/api.php";
-const MAX_OBJECT_BYTES: u64 = 200 * 1024 * 1024;
+const BASE_URL: &str = "https://temp.sh";
+const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
-pub struct CatboxPlugin {
+pub struct TempShPlugin {
     http: HttpClient,
 }
 
-impl CatboxPlugin {
+impl TempShPlugin {
     pub fn new() -> Self {
         let cfg = HttpClientConfig {
-            user_agent: "openstorage-catbox/0.1".into(),
+            user_agent: "openstorage-temp-sh/0.1".into(),
             ..Default::default()
         };
         Self {
@@ -56,20 +48,20 @@ impl CatboxPlugin {
     }
 }
 
-impl Default for CatboxPlugin {
+impl Default for TempShPlugin {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl PluginContract for CatboxPlugin {
+impl PluginContract for TempShPlugin {
     fn rate_limit_profile(&self) -> RateLimitProfile {
         RateLimitProfile {
-            label: "catbox.moe".into(),
+            label: "temp.sh".into(),
             puts: RateBucket::new(0.5, 2),
-            gets: RateBucket::new(4.0, 8),
-            peeks: RateBucket::new(4.0, 8),
+            gets: RateBucket::new(2.0, 4),
+            peeks: RateBucket::new(2.0, 4),
             deletes: RateBucket::new(0.5, 1),
             max_concurrent: 2,
             max_object_bytes: Some(MAX_OBJECT_BYTES),
@@ -83,31 +75,28 @@ impl PluginContract for CatboxPlugin {
     async fn put(&self, payload: &[u8], _hint: &PutHint) -> PluginResult<PutResult> {
         if payload.len() as u64 > MAX_OBJECT_BYTES {
             return Err(PluginError::Plugin(format!(
-                "payload {} exceeds catbox cap {}",
+                "payload {} exceeds temp.sh cap {}",
                 payload.len(),
                 MAX_OBJECT_BYTES
             )));
         }
-        let part = multipart::Part::bytes(payload.to_vec())
-            .file_name("blob.bin")
-            .mime_str("application/octet-stream")
-            .map_err(|e| PluginError::Plugin(format!("multipart: {e}")))?;
-        let form = multipart::Form::new()
-            .text("reqtype", "fileupload")
-            .part("fileToUpload", part);
-        let resp = self.http.post_multipart(UPLOAD_ENDPOINT, form).await?;
-        let url = std::str::from_utf8(&resp.body)
+        let url = format!("{BASE_URL}/upload/blob.bin");
+        let resp = self.http.put_bytes(&url, payload.to_vec()).await?;
+        let body = std::str::from_utf8(&resp.body)
             .map_err(|_| PluginError::Plugin("non-utf8 response".into()))?
-            .trim()
+            .trim();
+        // Response is sometimes the bare URL, sometimes a one-liner with
+        // surrounding whitespace.
+        let dl = body
+            .split_whitespace()
+            .find(|t| t.starts_with("https://temp.sh/"))
+            .ok_or_else(|| PluginError::Plugin(format!("bad response: {body}")))?
             .to_string();
-        if !(url.starts_with("https://files.catbox.moe/") || url.starts_with("https://catbox.moe/")) {
-            return Err(PluginError::Plugin(format!("bad response: {url}")));
-        }
         Ok(PutResult {
-            handle: NativeHandle(url.into_bytes()),
+            handle: NativeHandle(dl.into_bytes()),
             handle_changed: true,
             prior_handle_state: None,
-            stored_at: Timestamp::from_string("catbox"),
+            stored_at: Timestamp::from_string("temp.sh"),
             quota_reclaimed: QuotaReclaimed::Unknown,
             tombstone_clears_at: None,
         })
@@ -133,13 +122,13 @@ impl PluginContract for CatboxPlugin {
                     .header_str("content-length")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0),
-                mtime: Timestamp::from_string("catbox"),
+                mtime: Timestamp::from_string("temp.sh"),
                 etag: None,
             }),
             Err(PluginError::Plugin(m)) if m.contains("not found") => Ok(PeekResult {
                 exists: false,
                 size: 0,
-                mtime: Timestamp::from_string("catbox"),
+                mtime: Timestamp::from_string("temp.sh"),
                 etag: None,
             }),
             Err(e) => Err(e),
@@ -147,20 +136,18 @@ impl PluginContract for CatboxPlugin {
     }
 
     async fn delete(&self, _handle: &NativeHandle) -> PluginResult<DeleteResult> {
-        // Anonymous catbox puts have no delete API; the file persists until
-        // the operator garbage-collects abandoned content. Engine treats as
-        // Tombstoned and registers a Shadow.
         Ok(DeleteResult {
             outcome: DeleteOutcome::NotSupported,
             quota_reclaimed: QuotaReclaimed::No,
-            cached_elsewhere_risk: CachedElsewhereRisk::Medium,
+            cached_elsewhere_risk: CachedElsewhereRisk::Low,
             tombstone_clears_at: None,
         })
     }
 
     async fn health(&self) -> PluginResult<HealthReport> {
-        let state = match self.http.head("https://catbox.moe/").await {
+        let state = match self.http.head(BASE_URL).await {
             Ok(_) => HealthState::Healthy,
+            Err(PluginError::Plugin(msg)) if msg.contains("405") => HealthState::Healthy,
             _ => HealthState::Unhealthy,
         };
         Ok(HealthReport {
@@ -194,7 +181,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_round_trip() {
-        let p = CatboxPlugin::new();
+        let p = TempShPlugin::new();
         let payload: Vec<u8> = (0u8..=255).cycle().take(64 * 1024).collect();
         let r = p.put(&payload, &PutHint::default()).await.unwrap();
         let got = p.get(&r.handle, None).await.unwrap();

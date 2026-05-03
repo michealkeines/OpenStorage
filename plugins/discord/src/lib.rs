@@ -78,6 +78,8 @@ impl PluginContract for DiscordPlugin {
             max_object_bytes: Some(MAX_OBJECT_BYTES),
             total_quota_bytes: None,
             detector: Arc::new(DiscordDetector),
+            update_capability: os_plugin_host::UpdateCapability::None,
+            daily_op_budget: None,
         }
     }
 

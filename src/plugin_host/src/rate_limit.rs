@@ -82,6 +82,21 @@ pub struct RateLimitProfile {
     /// recognition rules and so non-HTTP plugins (LocalDirPlugin) can
     /// still register a no-op detector by accepting the default.
     pub detector: Arc<dyn crate::http::ratelimit::RateLimitDetector>,
+    /// Whether this backend can rewrite the bytes of an existing handle.
+    /// The slot-pool subsystem (ROUTING.md §5) inspects this to decide
+    /// whether `plugin.update(handle, …)` is worth attempting. Defaults
+    /// to `None`; plugins that override the trait's `update` method
+    /// SHOULD also set this to `AtomicReplace` or `TrueUpdate` so the
+    /// engine can pre-filter Update-capable providers without a probe.
+    pub update_capability: os_types::UpdateCapability,
+    /// Maximum successful ops the engine should issue against this
+    /// backend in any rolling 24 h window before backing off. Drives
+    /// `AbuseSensor` (ROUTING.md §6.3): we throttle ourselves *before*
+    /// the operator's ToS-triggered ban kicks in. `None` = no
+    /// declared cap; the engine treats it as effectively unlimited.
+    /// Examples: Imgur Client-IDs publish ~1250 uploads/hour ≈ 30k/day;
+    /// catbox/uguu publish nothing — set conservative defaults.
+    pub daily_op_budget: Option<u32>,
 }
 
 impl std::fmt::Debug for RateLimitProfile {
@@ -113,6 +128,8 @@ impl RateLimitProfile {
             max_object_bytes: None,
             total_quota_bytes: None,
             detector: Arc::new(crate::http::ratelimit::DefaultDetector),
+            update_capability: os_types::UpdateCapability::None,
+            daily_op_budget: None,
         }
     }
 
@@ -129,6 +146,8 @@ impl RateLimitProfile {
             max_object_bytes: None,
             total_quota_bytes: None,
             detector: Arc::new(crate::http::ratelimit::DefaultDetector),
+            update_capability: os_types::UpdateCapability::None,
+            daily_op_budget: None,
         }
     }
 }
@@ -155,7 +174,14 @@ impl Default for MiddlewarePolicy {
             max_transient_attempts: 5,
             min_backoff: Duration::from_millis(250),
             max_backoff: Duration::from_secs(30),
-            max_rate_limit_wait: None,
+            // ROUTING.md §13 Step 5. Was `None` (wait as long as the
+            // backend asks). With a 1 h `Retry-After` that meant the
+            // shard's put blocked for 1 h instead of the dispatcher
+            // walking to a sibling/cross-group candidate. 30 s gives
+            // ample slack for legitimate transient throttling while
+            // returning control to the dispatcher when a backend has
+            // gone genuinely cold.
+            max_rate_limit_wait: Some(Duration::from_secs(30)),
             jitter: Duration::from_millis(50),
         }
     }
@@ -550,10 +576,38 @@ impl PluginContract for RateLimitMiddleware {
         .await
     }
 
+    async fn update(
+        &self,
+        handle: &NativeHandle,
+        payload: &[u8],
+    ) -> PluginResult<PutResult> {
+        let h = Arc::new(handle.clone());
+        let payload_arc: Arc<[u8]> = Arc::from(payload);
+        // Treat update as a Put for budgeting (writes are writes).
+        self.run(Op::Put, move || {
+            let inner = self.inner.clone();
+            let hh = h.clone();
+            let p = payload_arc.clone();
+            async move { inner.update(&hh, &p).await }
+        })
+        .await
+    }
+
     async fn health(&self) -> PluginResult<HealthReport> {
         // Health checks bypass the bucket — they're cheap and we want them
         // to be honest about backend status.
         self.inner.health().await
+    }
+
+    /// Delegate to the inner plugin so callers like
+    /// `Host::rate_limit_profile_for` see the *live* declared profile
+    /// (including `update_capability`, `max_object_bytes`, …) rather
+    /// than the trait default. ROUTING.md §13 Step 7b depends on this:
+    /// the slot-pool path consults `update_capability` per provider,
+    /// and would never fire if the middleware swallowed the inner's
+    /// profile.
+    fn rate_limit_profile(&self) -> RateLimitProfile {
+        self.inner.rate_limit_profile()
     }
 }
 

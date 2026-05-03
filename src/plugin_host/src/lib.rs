@@ -15,8 +15,14 @@ pub mod http;
 pub mod lifecycle;
 pub mod local_dir;
 pub mod pool;
+pub mod abuse_sensor;
+pub mod account_rotator;
+pub mod capability_drift;
+pub mod circuit_breaker;
+pub mod idempotency_tracker;
 pub mod rate_limit;
 pub mod recording;
+pub mod slotpool;
 
 pub use contract::*;
 pub use host::Host;
@@ -26,6 +32,13 @@ pub use rate_limit::{
     CapacitySnapshot, MiddlewarePolicy, Op, RateBucket, RateLimitConfig, RateLimitMiddleware,
     RateLimitProfile, RateLimitStats,
 };
+pub use abuse_sensor::{AbuseSensor, AbuseSensorConfig};
+pub use account_rotator::{AccountRotator, AccountStrategy};
+pub use capability_drift::{CapabilityDriftConfig, CapabilityDriftDetector};
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+pub use idempotency_tracker::{IdempotencyTracker, IdempotencyTrackerConfig};
+pub use os_types::UpdateCapability;
+pub use slotpool::{SizeClass, Slot, SlotId, SlotOwnerId, SlotPool, SlotState};
 
 use thiserror::Error;
 
