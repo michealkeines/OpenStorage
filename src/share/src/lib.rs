@@ -317,7 +317,11 @@ impl ShareService {
     /// file_key (bumps `file_key_version`, re-encrypts inline payload),
     /// and removes the revoked recipient's `WrappedKey` from the file's
     /// OR-Set. Returns the new `file_key_version`.
-    pub fn revoke_share(&self, id: ShareId, now: Timestamp) -> Result<u64, ShareError> {
+    pub async fn revoke_share(
+        &self,
+        id: ShareId,
+        now: Timestamp,
+    ) -> Result<u64, ShareError> {
         let mut share = self
             .store
             .get_share(id)?
@@ -325,7 +329,7 @@ impl ShareService {
         share.revoked_at = Some(now);
         let file_id = share.wrapped_keys_ref.file_id;
         let or_set_add_id = share.wrapped_keys_ref.or_set_add_id;
-        let new_version = self.vfs.rotate_file_key(file_id)?;
+        let new_version = self.vfs.rotate_file_key(file_id).await?;
         let mut txn = Txn::new();
         self.store.put_share(&mut txn, &share)?;
         if let Some(mut file) = self.store.get_file(file_id)? {
@@ -526,6 +530,7 @@ mod tests {
 
         let new_v = svc
             .revoke_share(share.share_id, Timestamp::from_string("now"))
+            .await
             .unwrap();
         assert_eq!(new_v, 1);
         assert_eq!(vfs.file_key_version(meta.file_id).unwrap(), 1);

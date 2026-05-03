@@ -16,6 +16,7 @@ pub mod lifecycle;
 pub mod local_dir;
 pub mod pool;
 pub mod rate_limit;
+pub mod recording;
 
 pub use contract::*;
 pub use host::Host;

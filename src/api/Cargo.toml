@@ -19,6 +19,8 @@ os-crypto = { workspace = true }
 os-lease = { workspace = true }
 os-repair = { workspace = true }
 os-metadata = { workspace = true }
+os-chunk = { workspace = true }
+os-ec = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }

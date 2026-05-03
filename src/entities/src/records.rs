@@ -199,6 +199,14 @@ pub enum ShadowReason {
     /// reach them, and quota counting is uncertain.
     #[serde(rename = "plugin_banned")]
     PluginBanned,
+    /// Layer 4 of `STRUCTURAL_REWORK.md` — the file_key was rotated by a
+    /// share revoke (F-SH-3) and the chunk was re-encrypted under the new
+    /// key. The old shard's ciphertext on the backend is now decryptable
+    /// only by holders of the *previous* `file_key_version`, so it must be
+    /// shadowed for cleanup. `cached_elsewhere_risk: High` reflects that a
+    /// revoked recipient may have cached the old ciphertext + key.
+    #[serde(rename = "key_revoked")]
+    KeyRevoked,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

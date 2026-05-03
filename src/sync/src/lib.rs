@@ -103,11 +103,87 @@ impl SyncEngine {
     /// Append a CRDT op to the local WAL and return the resulting entry. The
     /// caller still mutates `metadata/` via the typed Store — until full
     /// field-level merge lands here, that two-step is explicit.
+    ///
+    /// **Note**: this path will reject oversize `LwwRegister` ops with
+    /// `WalError::EntryTooLarge`. Callers that may emit large values
+    /// should use [`apply_local_op_with_spill`] instead — that helper
+    /// transparently spills to the indirect `LwwRegisterIndirect` form
+    /// per ABSTRACTIONS §7 / `STRUCTURAL_REWORK.md` Layer 4 closure.
     pub fn apply_local_op(
         &self,
         op: Op,
         idempotency_key: Option<IdempotencyKey>,
     ) -> Result<WalEntry, SyncError> {
+        let entry = self.wal.append(op, idempotency_key)?;
+        Ok(entry)
+    }
+
+    /// Append a CRDT op, spilling the value to the metadata KV when the
+    /// resulting WAL entry would exceed `wal.max_entry_bytes`.
+    ///
+    /// Layer 4 of `STRUCTURAL_REWORK.md` — closes the §6.A.7 / drift
+    /// item #4 hole where a single op carrying a 100 KB value (e.g. a
+    /// long identity chain or a big share-recipient list) would either
+    /// blow up framing or be silently dropped. The transformation is:
+    ///
+    /// ```text
+    ///   LwwRegister { target, value }   (V > limit)
+    ///     ↓
+    ///   metadata.LargeValues[blake3(V)] = V
+    ///   LwwRegisterIndirect {
+    ///     target,
+    ///     value_hash:        blake3(V),
+    ///     value_storage_key: LocalKvKey(blake3(V)),
+    ///     value_size_bytes:  V.len(),
+    ///     previous_value_hash: None,
+    ///   }
+    /// ```
+    ///
+    /// `previous_value_hash` is left `None` here — the spec reserves
+    /// that field for an upcoming "compare-and-swap on indirect"
+    /// extension, but no caller emits a previous-value hint today.
+    ///
+    /// Spillover applies only to `LwwRegister` (the most common
+    /// large-value carrier). `OrSetAdd` / `MapPut` with large values
+    /// are still rejected — those entities have field-level schemas
+    /// that should not contain unbounded blobs in the first place
+    /// (and are listed in `policy::FORBIDDEN_INDIRECT_FIELDS` to
+    /// catch any drift).
+    pub fn apply_local_op_with_spill(
+        &self,
+        store: &Store,
+        op: Op,
+        idempotency_key: Option<IdempotencyKey>,
+    ) -> Result<WalEntry, SyncError> {
+        let limit = self.wal.config().max_entry_bytes;
+        // For `LwwRegister`, conservatively spill if the value alone
+        // would consume more than half the budget. The remaining
+        // headroom covers the entry envelope (wal_id, hlc, signature,
+        // key encoding) which in CBOR is generously under 1 KB.
+        let spill_threshold = limit.saturating_sub(1024).max(limit / 2);
+        if let Op::LwwRegister { target, value } = &op {
+            if value.len() > spill_threshold {
+                let value_hash = os_crypto::blake3_32(value);
+                let storage_key = os_types::LocalKvKey::new(value_hash.as_bytes().to_vec());
+                let value_size = value.len();
+                // Persist the spilled body. Idempotent under the
+                // content-addressed key — re-spilling the same value
+                // is a no-op-overwrite.
+                let mut txn = Txn::new();
+                store.put_large_value(&mut txn, storage_key.as_bytes(), value);
+                store.commit(txn)?;
+                let indirect = Op::LwwRegisterIndirect {
+                    target: target.clone(),
+                    value_hash,
+                    value_storage_key: storage_key,
+                    value_size_bytes: u32::try_from(value_size).unwrap_or(u32::MAX),
+                    previous_value_hash: None,
+                };
+                let entry = self.wal.append(indirect, idempotency_key)?;
+                return Ok(entry);
+            }
+        }
+        // Fast path: no spill, just append.
         let entry = self.wal.append(op, idempotency_key)?;
         Ok(entry)
     }
@@ -134,7 +210,41 @@ impl SyncEngine {
     ) -> Result<ApplyReport, SyncError> {
         let mut report = ApplyReport::default();
         for entry in entries {
-            match &entry.op {
+            // Layer 4 closure: a `LwwRegisterIndirect` is just a
+            // `LwwRegister` whose body lives in the local KV. Resolve
+            // the body and treat it identically downstream. If the
+            // body isn't present yet (peer hasn't pushed it), skip —
+            // the next reconcile pass will pick it up. We don't fail
+            // the batch.
+            let resolved_op: Op;
+            let op_ref: &Op = match &entry.op {
+                Op::LwwRegisterIndirect {
+                    target,
+                    value_storage_key,
+                    value_hash,
+                    ..
+                } => match store.get_large_value(value_storage_key.as_bytes())? {
+                    Some(v) => {
+                        // Defense: hash must match what the producer
+                        // committed to. Tampering or wrong key → skip.
+                        if os_crypto::blake3_32(&v) != *value_hash {
+                            report.skipped += 1;
+                            continue;
+                        }
+                        resolved_op = Op::LwwRegister {
+                            target: target.clone(),
+                            value: v,
+                        };
+                        &resolved_op
+                    }
+                    None => {
+                        report.skipped += 1;
+                        continue;
+                    }
+                },
+                other => other,
+            };
+            match op_ref {
                 Op::LwwRegister { target, value } if target.kind == KeyKind::File => {
                     let file_id = match decode_file_id(&target.primary) {
                         Some(f) => f,
@@ -619,5 +729,154 @@ mod tests {
         assert!(report.demotions.is_empty());
         let saved = st.get_shard(shard_id).unwrap().unwrap();
         assert_eq!(saved.native_handle.value, local_new);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Layer 4 baseline (per `STRUCTURAL_REWORK.md` drift item #4):
+    // oversized `LwwRegister` ops auto-spill to `LwwRegisterIndirect`
+    // and apply correctly on the remote side.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn small_lww_register_does_not_spill() {
+        let (wal, _) = open_wal();
+        let s = SyncEngine::new(wal.clone());
+        let st = store();
+        let op = Op::LwwRegister {
+            target: Key::new(KeyKind::File, vec![0u8; 16], "path"),
+            value: vec![0u8; 1024], // small, well under the 64 KB cap
+        };
+        let entry = s
+            .apply_local_op_with_spill(&st, op.clone(), None)
+            .expect("append");
+        // Should remain a direct LwwRegister.
+        assert!(matches!(entry.op, Op::LwwRegister { .. }));
+    }
+
+    #[test]
+    fn oversize_lww_register_spills_to_indirect() {
+        // Configure a tiny WAL cap so we don't have to allocate 64 KB
+        // just to provoke the spill — the policy is the same.
+        let mut p = std::env::temp_dir();
+        p.push(format!("os-sync-spill-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&p).unwrap();
+        let (sk, _pk) = generate_keypair(&mut OsRng);
+        let cfg = os_wal::WalConfig {
+            max_entry_bytes: 4 * 1024,
+        };
+        let dev = DeviceId::new_v7();
+        let wal = WalBuilder::new()
+            .path(p.join("wal.bin"))
+            .config(cfg)
+            .build(dev, sk)
+            .unwrap();
+        let s = SyncEngine::new(Arc::new(wal));
+        let st = store();
+        let big = vec![7u8; 8 * 1024];
+        let op = Op::LwwRegister {
+            target: Key::new(KeyKind::File, vec![0u8; 16], "content_type"),
+            value: big.clone(),
+        };
+        let entry = s
+            .apply_local_op_with_spill(&st, op, None)
+            .expect("spill should succeed");
+        match entry.op {
+            Op::LwwRegisterIndirect {
+                value_size_bytes,
+                value_storage_key,
+                value_hash,
+                ..
+            } => {
+                assert_eq!(value_size_bytes as usize, big.len());
+                // The body must be retrievable from the metadata KV
+                // under the storage key, byte-identical to the
+                // original, and content-addressed by hash.
+                let resolved =
+                    st.get_large_value(value_storage_key.as_bytes()).unwrap().expect("body");
+                assert_eq!(resolved, big);
+                assert_eq!(os_crypto::blake3_32(&resolved), value_hash);
+            }
+            _ => panic!("expected LwwRegisterIndirect, got {:?}", entry.op),
+        }
+    }
+
+    #[test]
+    fn indirect_op_resolves_through_remote_apply() {
+        // Two-phase: produce a spilled op locally, then feed the
+        // resulting WAL entry into apply_remote_wal_segment and
+        // assert the LwwRegister-equivalent merge fires (here, file
+        // path rename).
+        let mut p = std::env::temp_dir();
+        p.push(format!("os-sync-resolve-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&p).unwrap();
+        let (sk, _pk) = generate_keypair(&mut OsRng);
+        let cfg = os_wal::WalConfig {
+            max_entry_bytes: 4 * 1024,
+        };
+        let dev_b = DeviceId::new_v7();
+        let wal = WalBuilder::new()
+            .path(p.join("wal.bin"))
+            .config(cfg)
+            .build(dev_b, sk)
+            .unwrap();
+        let s = SyncEngine::new(Arc::new(wal));
+        let st = store();
+        let dev_a = DeviceId::new_v7();
+        let file_id = seed_file(&st, "/a", Hlc::new(1, 0), dev_a);
+
+        // Build a giant CBOR-encoded path string that pushes the op
+        // over the WAL cap.
+        let big_path = "/".to_string() + &"x".repeat(8 * 1024);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&big_path, &mut buf).unwrap();
+        let op = Op::LwwRegister {
+            target: Key::new(
+                KeyKind::File,
+                file_id.as_uuid().as_bytes().to_vec(),
+                "path",
+            ),
+            value: buf,
+        };
+        let mut indirect_entry = s
+            .apply_local_op_with_spill(&st, op, None)
+            .expect("spill");
+        // Force the entry's HLC ahead of the seeded file so the remote
+        // wins LWW and applies. Re-append manually with a fresh
+        // make_entry — apply_remote_wal_segment doesn't verify
+        // signatures here.
+        indirect_entry.hlc = Hlc::new(5, 0);
+        indirect_entry.device_id = dev_b;
+        let report = s
+            .apply_remote_wal_segment(&st, &[indirect_entry])
+            .expect("apply");
+        assert_eq!(
+            report.applied, 1,
+            "indirect op did not resolve+apply: {:?}",
+            report
+        );
+        let f = st.get_file(file_id).unwrap().unwrap();
+        assert_eq!(f.path.value, big_path);
+    }
+
+    #[test]
+    fn indirect_with_missing_body_skips_not_fails() {
+        // If the spilled body is absent (peer hasn't pushed it), the
+        // batch must be skipped without poisoning the entire merge.
+        let (wal, _) = open_wal();
+        let s = SyncEngine::new(wal);
+        let st = store();
+        // Hand-craft an indirect op pointing at a hash with no body.
+        let value_hash = os_crypto::blake3_32(b"never-stored");
+        let op = Op::LwwRegisterIndirect {
+            target: Key::new(KeyKind::File, vec![0u8; 16], "content_type"),
+            value_hash,
+            value_storage_key: os_types::LocalKvKey::new(value_hash.as_bytes().to_vec()),
+            value_size_bytes: 1024,
+            previous_value_hash: None,
+        };
+        let entry = make_entry(op, Hlc::new(2, 0), DeviceId::new_v7());
+        let report = s.apply_remote_wal_segment(&st, &[entry]).expect("apply");
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.applied, 0);
     }
 }

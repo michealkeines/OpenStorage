@@ -843,10 +843,51 @@ fn lease_blob_name(vault: os_types::VaultId) -> String {
     format!("{LEASE_BLOB_NAME_PREFIX}{vault}")
 }
 
+/// Pick a vault plugin suitable for sole-source coordination roles
+/// (lease, WAL push). Layer 3 closure (per `STRUCTURAL_REWORK.md`
+/// drift item #5): filter by `CasTier >= OptimisticCas` so an
+/// `EventualOnly` backend can never silently host the lease /
+/// per-device WAL slots — those records require at least
+/// optimistic CAS to avoid clobber races. If any vault plugins are
+/// registered but none meets the tier, return `None` and the caller
+/// surfaces a structured error rather than degrading to a
+/// no-CAS-write that would clobber a peer.
 fn vault_provider_for_lease(s: &AppState) -> Option<Arc<dyn os_plugin_host::VaultPluginContract>> {
-    let vps = s.host.list_vault();
+    let vps = s
+        .host
+        .vault_providers_at_least(os_types::CasTier::OptimisticCas);
     let pid = *vps.first()?;
     s.host.get_vault(pid).ok()
+}
+
+/// Same as [`vault_provider_for_lease`] but returns a structured
+/// error so the caller doesn't have to `.ok_or_else` and lose the
+/// distinction between "no plugins registered" and "plugins exist
+/// but only EventualOnly". Use this in handlers that benefit from
+/// the precise reason — the lease and WAL push paths can't safely
+/// run on an EventualOnly backend, and the caller deserves a
+/// pointed error.
+fn require_strongly_consistent_vault_plugin(
+    s: &AppState,
+    purpose: &str,
+) -> Result<Arc<dyn os_plugin_host::VaultPluginContract>, ApiError> {
+    if let Some(p) = vault_provider_for_lease(s) {
+        return Ok(p);
+    }
+    if s.host.list_vault().is_empty() {
+        Err(ApiError::bad(format!(
+            "{purpose} refused: no vault provider registered"
+        )))
+    } else {
+        // Plugins exist, but all are EventualOnly. Surface the
+        // structural reason instead of pretending nothing is
+        // registered.
+        Err(ApiError::bad(format!(
+            "{purpose} refused: every registered vault provider is EventualOnly; \
+             at least OptimisticCas is required to host this record without \
+             clobbering a concurrent peer (Layer 3 / structural rework #5)"
+        )))
+    }
 }
 
 async fn read_vault_lease(
@@ -1627,71 +1668,265 @@ async fn process_repair_task(
             Ok(())
         }
         RepairSource::PluginBan => {
-            // Layer 2 — a provider was Banned by `HealthMonitor`. For
-            // every shard of this chunk hosted on a Banned provider:
-            // register a `Shadow` (so the residual report counts the
-            // bytes), drop the shard from the chunk's `shard_list`, and
-            // mark the chunk Degraded. Re-placement onto a healthy
-            // provider is a Layer 4 closure — for now we shed the
-            // banned shards and let the existing healthy replicas serve
-            // reads.
-            let mut surviving: Vec<os_types::ShardId> = Vec::with_capacity(chunk.shard_list.len());
-            let mut shadowed: Vec<os_entities::Shadow> = Vec::new();
+            // Layer 2 closure (per STRUCTURAL_REWORK drift item #2): a
+            // provider was Banned by `HealthMonitor`. The structural
+            // contract is "no silent durability loss after a ban". To
+            // honor it we:
+            //
+            //   1. Classify each shard as `surviving` (on a healthy
+            //      provider) or `banned` (on a Banned provider).
+            //   2. If at least `k` survived AND there are healthy
+            //      providers not already hosting a slot of this chunk,
+            //      reconstruct the EC ciphertext from `k` surviving
+            //      shards and re-encode it to recover the missing
+            //      slots' bytes. (This is ciphertext-level recovery —
+            //      no AEAD decrypt needed because we keep the existing
+            //      nonce/tag and just place the same EC ciphertext on
+            //      a different backend. The chunk_key is never
+            //      touched.)
+            //   3. For each banned slot we successfully re-place,
+            //      update the `Shard` record in place (same shard_id,
+            //      since `shard_id_for(chunk_hash, shard_index)` is
+            //      content-addressed) with the new provider/handle and
+            //      `AckState::Acked`.
+            //   4. Always shadow the original banned native_handle so
+            //      the residual report still counts the orphaned
+            //      bytes on the banned backend.
+            //   5. If re-placement isn't possible (insufficient
+            //      survivors, no healthy targets, or a put failure),
+            //      fall back to the previous shed-only behavior — the
+            //      banned shard is removed from the chunk's shard_list
+            //      and the chunk is Degraded. Tombstone for that
+            //      handle is registered as a Shadow.
+            use os_chunk::shard_id_for;
+            use os_entities::{
+                LwwSet, ReplicationState, Shadow, ShadowReason, ShadowState,
+            };
+            use os_types::CachedElsewhereRisk;
+
+            let mut surviving_shards: Vec<os_entities::Shard> = Vec::new();
+            let mut banned_shards: Vec<os_entities::Shard> = Vec::new();
             for shard_id in &chunk.shard_list {
                 let shard = match store.get_shard(*shard_id) {
                     Ok(Some(sh)) => sh,
-                    _ => {
-                        continue;
-                    }
+                    _ => continue,
                 };
-                let provider = shard.driver_id.value;
-                if s.host.provider_health(provider).is_banned() {
-                    use os_entities::{Shadow, ShadowReason, ShadowState};
-                    use os_types::CachedElsewhereRisk;
-                    shadowed.push(Shadow {
-                        shadow_id: os_types::ShadowId::new_v7(),
-                        original_chunk_hash: chunk.chunk_hash,
-                        driver_id: provider,
-                        native_handle: shard.native_handle.value.clone(),
-                        ciphertext_length: shard.ciphertext_length,
-                        abandoned_at: os_types::Timestamp::from_string(&repair_now_iso()),
-                        reason: ShadowReason::PluginBanned,
-                        cached_elsewhere_risk: CachedElsewhereRisk::High,
-                        counts_against_quota: true,
-                        tombstone_clears_at: None,
-                        state: ShadowState::Registered,
-                        peek_count: 0,
-                    });
+                if s.host.provider_health(shard.driver_id.value).is_banned() {
+                    banned_shards.push(shard);
                 } else {
-                    surviving.push(*shard_id);
+                    surviving_shards.push(shard);
                 }
             }
-            if shadowed.is_empty() {
+            if banned_shards.is_empty() {
+                // Nothing to do — the chunk was probably re-banned
+                // and re-fixed concurrently. Idempotent.
                 return Ok(());
             }
+
+            let scheme = chunk.ec_scheme;
+            let n = scheme.n as usize;
+            let k = scheme.k as usize;
+
+            // Healthy providers not already used by this chunk are the
+            // re-placement candidates. `current_pool()` already filters
+            // out Banned/Quarantined per Layer 2.
+            let pool = s
+                .vault
+                .current_pool()
+                .map_err(|e| format!("current_pool: {e}"))?;
+            let in_use: std::collections::HashSet<os_types::ProviderId> = surviving_shards
+                .iter()
+                .map(|sh| sh.driver_id.value)
+                .collect();
+            let mut candidates: Vec<os_types::ProviderId> = pool
+                .providers
+                .iter()
+                .map(|p| p.provider_id)
+                .filter(|pid| !in_use.contains(pid))
+                .collect();
+
+            let now_ts = os_types::Timestamp::from_string(repair_now_iso());
+            let device = s.device_id;
+            let hlc = s.vfs.sync().wal().current_hlc();
+            let hlc = if hlc == os_types::Hlc::ZERO {
+                os_types::Hlc::new(1, 0)
+            } else {
+                hlc
+            };
+
+            // Try ciphertext-level reconstruction + re-place if we have
+            // enough surviving shards and at least one healthy target.
+            let mut replaced: std::collections::HashMap<u8, os_entities::Shard> =
+                std::collections::HashMap::new();
+            if surviving_shards.len() >= k && !candidates.is_empty() {
+                let mut slot_bytes: Vec<Option<Vec<u8>>> = vec![None; n];
+                let mut nonce: Option<os_types::AeadNonce> = None;
+                let mut tag: Option<os_types::AeadTag> = None;
+                let mut have = 0usize;
+                for sh in &surviving_shards {
+                    if have >= k {
+                        break;
+                    }
+                    let plugin = match s.host.get_chunk(sh.driver_id.value) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    match plugin.get(&sh.native_handle.value, None).await {
+                        Ok(bytes) => {
+                            slot_bytes[sh.shard_index as usize] = Some(bytes);
+                            nonce.get_or_insert(sh.encryption_nonce.clone());
+                            tag.get_or_insert(sh.encryption_tag);
+                            have += 1;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                // `chunk.plaintext_length` is reused as the ciphertext
+                // length for ChaCha20-Poly1305 / AES-GCM (they're equal;
+                // the 16-byte tag is carried separately). Same trick as
+                // `read_one_chunk` — see the comment block there.
+                let ciphertext_length = chunk.plaintext_length as usize;
+                if have >= k {
+                    if let (Ok(reconstructed), Some(nonce), Some(tag)) = (
+                        os_ec::reconstruct(scheme, slot_bytes, ciphertext_length),
+                        nonce,
+                        tag,
+                    ) {
+                        if let Ok(re_encoded) = os_ec::encode(scheme, &reconstructed) {
+                            for banned in &banned_shards {
+                                let slot = banned.shard_index as usize;
+                                if slot >= re_encoded.len() {
+                                    continue;
+                                }
+                                let target = match candidates.pop() {
+                                    Some(p) => p,
+                                    None => break,
+                                };
+                                let plugin = match s.host.get_chunk(target) {
+                                    Ok(p) => p,
+                                    Err(_) => continue,
+                                };
+                                match plugin
+                                    .put(&re_encoded[slot], &os_entities::PutHint::default())
+                                    .await
+                                {
+                                    Ok(put_res) => {
+                                        let new_shard_id =
+                                            shard_id_for(chunk.chunk_hash, banned.shard_index);
+                                        let new_shard = os_entities::Shard {
+                                            shard_id: new_shard_id,
+                                            chunk_hash: chunk.chunk_hash,
+                                            shard_index: banned.shard_index,
+                                            encryption_nonce: nonce.clone(),
+                                            encryption_tag: tag,
+                                            ciphertext_length: re_encoded[slot].len() as u64,
+                                            driver_id: LwwSet::new(target, None, hlc, device),
+                                            native_handle: LwwSet::new(
+                                                put_res.handle,
+                                                None,
+                                                hlc,
+                                                device,
+                                            ),
+                                            stored_at: now_ts.clone(),
+                                            last_verified_at: now_ts.clone(),
+                                            health_score: os_types::HealthScore::new(1.0),
+                                            ack_state: os_entities::AckState::Acked,
+                                        };
+                                        replaced.insert(banned.shard_index, new_shard);
+                                    }
+                                    Err(e) => {
+                                        // Re-place failed; record on health monitor so
+                                        // future attempts may pick a different target,
+                                        // and fall through to shed for this slot.
+                                        s.host.record_error(target, &e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build new shard_list:
+            //   - Keep all surviving shards untouched.
+            //   - For each banned slot:
+            //       * if replaced → use the new shard_id (same as
+            //         `shard_id_for(chunk_hash, shard_index)`),
+            //       * else → drop from list (shed-only fallback).
+            let mut new_shard_list: Vec<os_types::ShardId> =
+                surviving_shards.iter().map(|s| s.shard_id).collect();
+            for banned in &banned_shards {
+                if let Some(new_shard) = replaced.get(&banned.shard_index) {
+                    new_shard_list.push(new_shard.shard_id);
+                }
+            }
+            // Stable order: by shard_index for any future iteration.
+            // (We need to load the records to sort by index; the
+            // chunk's shard_list is already inherently ordered by the
+            // initial persist_chunk write, and re-placed slots keep
+            // their original index because they reuse `shard_id_for`,
+            // so a simple sort by `shard_index` of the loaded records
+            // is unnecessary — preserving insertion order keeps the
+            // original layout for surviving shards and appends new
+            // ones in banned-slot order.)
+
+            // Always shadow the banned native_handles so the residual
+            // accounting catches the orphaned bytes on the banned
+            // backend, even when we successfully re-placed elsewhere.
+            let mut shadowed: Vec<Shadow> = Vec::with_capacity(banned_shards.len());
+            for banned in &banned_shards {
+                shadowed.push(Shadow {
+                    shadow_id: os_types::ShadowId::new_v7(),
+                    original_chunk_hash: chunk.chunk_hash,
+                    driver_id: banned.driver_id.value,
+                    native_handle: banned.native_handle.value.clone(),
+                    ciphertext_length: banned.ciphertext_length,
+                    abandoned_at: now_ts.clone(),
+                    reason: ShadowReason::PluginBanned,
+                    cached_elsewhere_risk: CachedElsewhereRisk::High,
+                    counts_against_quota: true,
+                    tombstone_clears_at: None,
+                    state: ShadowState::Registered,
+                    peek_count: 0,
+                });
+            }
+
+            // Determine the final replication state. The chunk is
+            // Full only if every banned slot was successfully replaced.
+            let new_state = if new_shard_list.is_empty() {
+                ReplicationState::Lost
+            } else if replaced.len() == banned_shards.len() {
+                ReplicationState::Full
+            } else {
+                ReplicationState::Degraded
+            };
+
+            // Persist atomically.
             let mut txn = os_metadata::Txn::new();
             for sh in &shadowed {
                 store
                     .put_shadow(&mut txn, sh)
                     .map_err(|e| format!("put_shadow: {e}"))?;
             }
-            // Drop banned shards from the chunk's shard list and
-            // mark Degraded.
+            for new_shard in replaced.values() {
+                store
+                    .put_shard(&mut txn, new_shard)
+                    .map_err(|e| format!("put_shard: {e}"))?;
+            }
             let mut updated_chunk = chunk.clone();
-            updated_chunk.shard_list = surviving;
-            updated_chunk.replication_state = if updated_chunk.shard_list.is_empty() {
-                os_entities::ReplicationState::Lost
-            } else {
-                os_entities::ReplicationState::Degraded
-            };
+            updated_chunk.shard_list = new_shard_list;
+            updated_chunk.replication_state = new_state;
             store
                 .put_chunk(&mut txn, &updated_chunk)
                 .map_err(|e| format!("put_chunk: {e}"))?;
-            store
-                .commit(txn)
-                .map_err(|e| format!("commit: {e}"))?;
-            s.events
-                .publish(os_events::Event::new("plugin.banned"));
+            store.commit(txn).map_err(|e| format!("commit: {e}"))?;
+
+            // Emit a richer event so subscribers can distinguish
+            // "shed" from "shed + replaced".
+            s.events.publish(os_events::Event::new("plugin.banned"));
+            if !replaced.is_empty() {
+                s.events.publish(os_events::Event::new("repair.replaced"));
+            }
             Ok(())
         }
     }
@@ -1724,8 +1959,12 @@ async fn wal_push(
     State(s): State<AppState>,
     Path(_vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let plugin = vault_provider_for_lease(&s)
-        .ok_or_else(|| ApiError::bad("no vault provider registered"))?;
+    // F-MD-5 / drift #5: per-device WAL slots use cas_write with
+    // `expected_etag=None` to express "succeed only on first write".
+    // That guarantee evaporates on EventualOnly backends, where the
+    // CAS check is a no-op and a concurrent peer can clobber. Refuse
+    // to push WAL through an EventualOnly provider.
+    let plugin = require_strongly_consistent_vault_plugin(&s, "wal push")?;
     let wal = s.vfs.sync().wal();
     let entries = wal
         .scan_since(wal.min_seq())
@@ -2096,6 +2335,7 @@ async fn revoke_share(
     let new_v = s
         .share
         .revoke_share(id, os_types::Timestamp::from_string("now"))
+        .await
         .map_err(|e| match e {
             os_share::ShareError::NotFound(_) => ApiError::not_found("share"),
             os_share::ShareError::VaultLocked => ApiError::locked("revoke: vault locked"),
@@ -2329,49 +2569,106 @@ async fn push_snapshot_route(
              EventualOnly backends cannot host the snapshot pointer (Layer 3)",
         ));
     }
+    // Layer 3 closure (drift item #6): when ≥ 2 OptimisticCas
+    // providers are registered, fan out the put across ALL of them
+    // and accept at floor(N/2)+1 successful verify-after-upload acks.
+    // This is the structural improvement the original Layer 3 drift
+    // log scoped out: "≥3 OptimisticCas backends form a quorum"
+    // becomes a real fan-out + majority gate so a single backend
+    // dropping a write doesn't strand the snapshot. With one provider
+    // we degenerate to the original single-write path (quorum of 1).
+    //
+    // The verify pass remains size-based (etag families differ across
+    // backends; AEAD tag in the blob is the real integrity check).
     let mut verify_failed = false;
     let mut put_handle_hex: Option<String> = None;
-    let pushed_to: Option<String> = if let Some(provider_id) = vps.first() {
-        let vp = s
-            .host
-            .get_vault(*provider_id)
-            .map_err(|e| ApiError::bad(format!("get_vault_plugin: {e}")))?;
-        match vp
-            .put(&blob, &os_entities::PutHint::default())
-            .await
-        {
-            Ok(put_result) => {
-                put_handle_hex = Some(hex::encode(&put_result.handle.0));
-                // F-SN-1 verify-after-upload: peek the freshly written
-                // handle and confirm its size matches what we sent.
-                if let Ok(peek) = vp.peek(&put_result.handle).await {
-                    if !peek.exists || peek.size != blob.len() as u64 {
-                        verify_failed = true;
+    let mut pushed_to_pids: Vec<String> = Vec::new();
+    let mut acked = 0usize;
+    let mut last_err: Option<String> = None;
+    if !vps.is_empty() {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        type PutFut = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = (
+                            os_types::ProviderId,
+                            Result<
+                                os_plugin_host::PutResult,
+                                os_plugin_host::PluginError,
+                            >,
+                        ),
+                    > + Send,
+            >,
+        >;
+        let mut inflight: FuturesUnordered<PutFut> = FuturesUnordered::new();
+        for pid in &vps {
+            let vp = s.host.get_vault(*pid).ok();
+            let pid = *pid;
+            let blob = blob.clone();
+            inflight.push(Box::pin(async move {
+                match vp {
+                    Some(vp) => {
+                        let r = vp
+                            .put(&blob, &os_entities::PutHint::default())
+                            .await;
+                        (pid, r)
                     }
-                    // NB: we do NOT compare `peek.etag` to a locally
-                    // recomputed digest — backends use different hash
-                    // families (testbench BLAKE2b-256, LocalDirPlugin
-                    // BLAKE3-32, S3 MD5). Size + exists is the
-                    // cross-backend portable signal; finer integrity
-                    // checks live in the AEAD tag covering `blob`.
-                    let _ = (peek.etag, etag);
+                    None => (
+                        pid,
+                        Err(os_plugin_host::PluginError::NotFound(
+                            "vault plugin gone".into(),
+                        )),
+                    ),
                 }
-                if verify_failed {
-                    None
-                } else {
-                    Some(provider_id.to_string())
+            }));
+        }
+        let majority = (vps.len() / 2) + 1;
+        while let Some((pid, res)) = inflight.next().await {
+            match res {
+                Ok(put_result) => {
+                    // Verify-after-upload: peek and confirm size. A
+                    // partial write that returns Ok but reports the
+                    // wrong size doesn't count toward the quorum.
+                    let vp = match s.host.get_vault(pid) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if let Ok(peek) = vp.peek(&put_result.handle).await {
+                        let _ = peek.etag;
+                        if !peek.exists || peek.size != blob.len() as u64 {
+                            verify_failed = true;
+                            continue;
+                        }
+                    }
+                    if put_handle_hex.is_none() {
+                        put_handle_hex = Some(hex::encode(&put_result.handle.0));
+                    }
+                    pushed_to_pids.push(pid.to_string());
+                    acked += 1;
+                }
+                Err(e) => {
+                    last_err = Some(format!("{pid}: {e}"));
                 }
             }
-            Err(_) => None,
         }
-    } else {
-        None
-    };
-    if verify_failed {
+        if acked < majority {
+            return Err(ApiError::bad(format!(
+                "snapshot push quorum not met: {acked} of {} (need {majority}); last error: {}",
+                vps.len(),
+                last_err.unwrap_or_else(|| "(none)".into()),
+            )));
+        }
+    }
+    if verify_failed && acked == 0 {
         return Err(ApiError::bad(
             "verify-after-upload mismatch; pointer not advanced",
         ));
     }
+    let pushed_to: Option<String> = if pushed_to_pids.is_empty() {
+        None
+    } else {
+        Some(pushed_to_pids.join(","))
+    };
 
     vault.snapshot_pointer.version_counter =
         os_types::MonotonicCounter(vault.snapshot_pointer.version_counter.0 + 1);

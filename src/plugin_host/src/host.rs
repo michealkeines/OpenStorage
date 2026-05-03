@@ -18,7 +18,10 @@ use crate::{PluginError, Result};
 pub struct Host {
     chunk_plugins: RwLock<HashMap<ProviderId, ChunkEntry>>,
     vault_plugins: RwLock<HashMap<ProviderId, Arc<dyn VaultPluginContract>>>,
-    health: HealthMonitor,
+    /// Shared so the per-provider `RecordingChunkPlugin` /
+    /// `RecordingVaultPlugin` wrappers can feed the same classifier
+    /// without holding a back-reference to the whole `Host`.
+    health: Arc<HealthMonitor>,
 }
 
 #[derive(Clone)]
@@ -36,7 +39,7 @@ impl Host {
         Self {
             chunk_plugins: RwLock::new(HashMap::new()),
             vault_plugins: RwLock::new(HashMap::new()),
-            health: HealthMonitor::default(),
+            health: Arc::new(HealthMonitor::default()),
         }
     }
 
@@ -125,7 +128,15 @@ impl Host {
         let cfg = RateLimitConfig::from_profile(&profile, &policy);
         let label = format!("chunk:{}:{}", profile.label, id);
         let mw = Arc::new(RateLimitMiddleware::new(plugin, cfg).with_label(label));
-        let wrapped: Arc<dyn PluginContract> = mw.clone();
+        // Outer wrapper auto-records every put/get/peek/delete to the
+        // shared `HealthMonitor` (Layer 2 closure).
+        let wrapped: Arc<dyn PluginContract> = Arc::new(
+            crate::recording::RecordingChunkPlugin::new(
+                mw.clone(),
+                self.health.clone(),
+                id,
+            ),
+        );
         self.chunk_plugins.write().expect("host registry").insert(
             id,
             ChunkEntry {
@@ -138,10 +149,13 @@ impl Host {
     /// Register without any pacing. Test fixtures only — production paths
     /// always go through `register_chunk` so profiles are honored.
     pub fn register_chunk_unpaced(&self, id: ProviderId, plugin: Arc<dyn PluginContract>) {
+        let wrapped: Arc<dyn PluginContract> = Arc::new(
+            crate::recording::RecordingChunkPlugin::new(plugin, self.health.clone(), id),
+        );
         self.chunk_plugins.write().expect("host registry").insert(
             id,
             ChunkEntry {
-                plugin,
+                plugin: wrapped,
                 middleware: None,
             },
         );
@@ -159,7 +173,13 @@ impl Host {
         let mw = Arc::new(
             RateLimitMiddleware::new(plugin, cfg).with_label(format!("chunk:{id}")),
         );
-        let wrapped: Arc<dyn PluginContract> = mw.clone();
+        let wrapped: Arc<dyn PluginContract> = Arc::new(
+            crate::recording::RecordingChunkPlugin::new(
+                mw.clone(),
+                self.health.clone(),
+                id,
+            ),
+        );
         self.chunk_plugins.write().expect("host registry").insert(
             id,
             ChunkEntry {
@@ -170,10 +190,13 @@ impl Host {
     }
 
     pub fn register_vault(&self, id: ProviderId, plugin: Arc<dyn VaultPluginContract>) {
+        let wrapped: Arc<dyn VaultPluginContract> = Arc::new(
+            crate::recording::RecordingVaultPlugin::new(plugin, self.health.clone(), id),
+        );
         self.vault_plugins
             .write()
             .expect("host registry")
-            .insert(id, plugin);
+            .insert(id, wrapped);
     }
 
     pub fn get_chunk(&self, id: ProviderId) -> Result<Arc<dyn PluginContract>> {

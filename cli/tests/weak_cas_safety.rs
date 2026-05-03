@@ -365,3 +365,156 @@ async fn layer3_strongcas_provider_succeeds() {
 fn _refer_object_bytes() -> Option<ObjectBytes> {
     None
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Layer 3 closure baseline (per `STRUCTURAL_REWORK.md` drift item #5):
+// the lease and WAL push paths must apply the same CAS-tier filter as
+// snapshot push. Pre-fix they accepted any registered vault provider —
+// meaning a Discord-only deployment would silently install the
+// per-vault lease blob on a backend that can't honor cas_write, and
+// concurrent peers could clobber each other's leases.
+// ──────────────────────────────────────────────────────────────────────────
+
+async fn spawn_eventual_only_engine(
+    tmp: &tempfile::TempDir,
+) -> (
+    String,
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let data_dir: PathBuf = tmp.path().join("engine-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let backend = BackendConfig::Sled {
+        path: data_dir.join("metadata"),
+    }
+    .open()
+    .unwrap();
+    let store = Arc::new(Store::new(backend));
+
+    let host = Arc::new(Host::new());
+    let pid = ProviderId::new_v7();
+    host.register_vault(pid, Arc::new(EventualOnlyVaultPlugin));
+    assert_eq!(host.vault_cas_tier(pid), Some(CasTier::EventualOnly));
+
+    let identity = Arc::new(IdentityService::new(store.clone()));
+    let vault = Arc::new(VaultManager::new(store.clone(), host.clone()));
+    let (sk, _pk) = generate_keypair(&mut OsRng);
+    let device_id = DeviceId::new_v7();
+    let wal = WalBuilder::new()
+        .path(data_dir.join("wal.bin"))
+        .build(device_id, sk)
+        .unwrap();
+    let sync = Arc::new(SyncEngine::new(Arc::new(wal)));
+    let recovery = Arc::new(RecoveryService::new(
+        store.clone(),
+        identity.clone(),
+        vault.clone(),
+    ));
+    let vfs = Arc::new(VfsService::with_host(
+        store.clone(),
+        vault.clone(),
+        sync,
+        host.clone(),
+        os_vfs::VfsConfig::default(),
+    ));
+    let lease = Arc::new(LeaseService::new());
+    let repair = Arc::new(RepairScheduler::new(1024));
+    let events = Arc::new(EventBus::new());
+    let share = Arc::new(ShareService::new(store.clone(), vfs.clone()));
+    let oauth = Arc::new(os_plugin_host::lifecycle::OAuthCoordinator::new());
+
+    let app = router(AppState {
+        recovery,
+        vault: vault.clone(),
+        vfs,
+        identity,
+        lease,
+        repair,
+        events,
+        host: host.clone(),
+        share,
+        oauth,
+        plugin_authors: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        plugin_capabilities: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        device_id,
+        fault: None,
+        plugin_states: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        plugin_decisions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let join = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/vaults", base))
+        .json(&serde_json::json!({ "passphrase": "hunter2" }))
+        .send().await.unwrap();
+    assert!(resp.status().is_success());
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let vault_id = v["vault_id"].as_str().unwrap().to_string();
+
+    (base, vault_id, tx, join)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn layer3_baseline_eventual_only_refused_for_wal_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, vault_id, shutdown, join) = spawn_eventual_only_engine(&tmp).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/vaults/{}/wal/push", base, vault_id))
+        .send().await.unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        !status.is_success(),
+        "wal push silently succeeded against EventualOnly backend; body={body}"
+    );
+    let lc = body.to_lowercase();
+    assert!(
+        lc.contains("eventual") || lc.contains("cas") || lc.contains("layer 3"),
+        "wal push refusal lacks CAS-tier reason: {body}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = join.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn layer3_baseline_eventual_only_refused_for_lease_steal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, vault_id, shutdown, join) = spawn_eventual_only_engine(&tmp).await;
+
+    let client = reqwest::Client::new();
+    // /lease/steal is the load-bearing CAS-coupled lease op (F-MD-4).
+    // It must refuse on EventualOnly: a successful "steal" without
+    // honest CAS would trample a peer's existing lease.
+    let resp = client
+        .post(format!("{}/v1/vaults/{}/lease/steal", base, vault_id))
+        .send().await.unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    // The handler may return a structured-bad message OR fall through
+    // a no-vault-plugin code path that surfaces the same CAS-tier
+    // reason; either way it must NOT report success.
+    assert!(
+        !status.is_success(),
+        "lease/steal silently succeeded against EventualOnly backend; body={body}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = join.await;
+}

@@ -926,12 +926,27 @@ impl VfsService {
         })
     }
 
-    /// F-SH-3 helper: bump a file's `file_key_version`, derive a fresh
-    /// file_key, and re-encrypt the inline payload (if any) under it.
-    /// Chunked payloads are flagged for async re-encryption — the spec
-    /// says "heavy — async via repair scheduler" and the chunked rewrite
-    /// is owned by `repair/`.
-    pub fn rotate_file_key(&self, file_id: FileId) -> Result<u64, VfsError> {
+    /// F-SH-3: bump a file's `file_key_version`, derive a fresh
+    /// `file_key`, and re-encrypt all on-disk material under it so a
+    /// recipient holding the previous key generation can no longer
+    /// decrypt the bytes that backends now hold. Both the inline path
+    /// and the chunked path are handled here:
+    ///
+    /// - **Inline**: AEAD-decrypt the `InlineBlob` with the old key,
+    ///   AEAD-encrypt under the new key, persist.
+    /// - **Chunked**: for each `ChunkHash` in `chunk_list`, fetch+decrypt
+    ///   the chunk plaintext (via the existing hedged-read machinery)
+    ///   under the old key, then re-`persist_chunk` under the new key.
+    ///   The chunk is content-addressed by plaintext+vault_salt+index,
+    ///   so the `ChunkHash` is unchanged and the new `Chunk`/`Shard`
+    ///   records overwrite the old ones in metadata. The old shard
+    ///   *records* are deleted; the old shard *ciphertext on backends*
+    ///   is registered as a `Shadow` with `ShadowReason::KeyRevoked` so
+    ///   it can be GC'd by the repair pipeline.
+    ///
+    /// This is the structural fix for the Layer 4 drift item: revoke is
+    /// no longer paperwork on chunked files.
+    pub async fn rotate_file_key(&self, file_id: FileId) -> Result<u64, VfsError> {
         let mk = self.vault.master_key().ok_or(VfsError::VaultLocked)?;
         // F-SH-3: vault- and folder-scope shares bind to a synthetic
         // FileId with no backing record. Bump a virtual key version
@@ -941,16 +956,18 @@ impl VfsService {
             Some(f) => f,
             None => return Ok(1),
         };
-        let new_version = file.file_key_version + 1;
+        let old_version = file.file_key_version;
+        let new_version = old_version + 1;
+
         if let Some(payload) = file.inline_payload.clone() {
-            let old_key = derive_file_key(&mk, file_id, file.file_key_version)?;
+            let old_key = derive_file_key(&mk, file_id, old_version)?;
             let pt = aead_decrypt(
                 self.cfg.aead_suite,
                 &old_key,
                 &payload.nonce,
                 &payload.ciphertext,
                 &payload.tag,
-                &inline_aad(file_id, file.file_key_version),
+                &inline_aad(file_id, old_version),
             )?;
             let new_key = derive_file_key(&mk, file_id, new_version)?;
             let nonce = random_nonce_12();
@@ -967,11 +984,127 @@ impl VfsService {
                 tag,
             });
         }
+
+        if let Some(chunk_list) = file.chunk_list.clone() {
+            let old_file_key = derive_file_key(&mk, file_id, old_version)?;
+            let new_file_key = derive_file_key(&mk, file_id, new_version)?;
+            for (idx, ch) in chunk_list.iter().enumerate() {
+                self.re_encrypt_chunk(*ch, idx as u64, &old_file_key, &new_file_key)
+                    .await?;
+            }
+        }
+
         file.file_key_version = new_version;
         let mut txn = Txn::new();
         self.store.put_file(&mut txn, &file)?;
         self.store.commit(txn)?;
         Ok(new_version)
+    }
+
+    /// Read one chunk's plaintext using `old_file_key`, then re-encrypt
+    /// and re-place it under `new_file_key`. Old shard records are
+    /// deleted; old shard ciphertext on backends is shadowed for GC.
+    ///
+    /// Failure modes & atomicity: this method is not transactional with
+    /// respect to the entire file's revoke. If we crash after re-placing
+    /// chunk N but before completing chunk N+1, on retry the next call
+    /// will read chunk N+1 with the *old* key (since `file_key_version`
+    /// has not yet been bumped) and re-place it — idempotent. Chunks
+    /// already re-placed under the new key in the previous run are
+    /// orphaned but recoverable: the new shards live, the old shards
+    /// (now under the same `chunk_hash` key) were already overwritten.
+    /// Worst case is one chunk's worth of orphaned ciphertext, captured
+    /// by the existing repair/scrub Shadow plumbing.
+    async fn re_encrypt_chunk(
+        &self,
+        chunk_hash: ChunkHash,
+        chunk_index: u64,
+        old_file_key: &os_crypto::SymKey,
+        new_file_key: &os_crypto::SymKey,
+    ) -> Result<(), VfsError> {
+        // 1. Snapshot the old shards before re-place overwrites them.
+        let old_chunk = self
+            .store
+            .get_chunk(chunk_hash)?
+            .ok_or_else(|| VfsError::Metadata(format!("missing chunk {}", chunk_hash)))?;
+        let mut old_shards: Vec<Shard> = Vec::with_capacity(old_chunk.shard_list.len());
+        for sid in &old_chunk.shard_list {
+            if let Some(s) = self.store.get_shard(*sid)? {
+                old_shards.push(s);
+            }
+        }
+
+        // 2. Decrypt under the old file_key via the same hedged-read
+        // machinery used by `read_stream`. Re-using the ranked-fan-out
+        // path means we get `K + read_hedge` parallel fetches, fall back
+        // on rate-limit / not-found, and inline-read-repair triggers
+        // for free if a shard is missing.
+        let plaintext = read_one_chunk(
+            self.store.clone(),
+            self.plugin_host.clone(),
+            chunk_hash,
+            chunk_index as usize,
+            old_file_key.clone(),
+            self.cfg.aead_suite,
+            self.cfg.read_hedge as usize,
+            self.repair.clone(),
+        )
+        .await?;
+
+        // 3. Re-encrypt + re-place under the new file_key. `persist_chunk`
+        // overwrites the `Chunk` record at the same content-addressed key
+        // and writes fresh `Shard` records with new `shard_id`s.
+        let new_chunk_key = derive_chunk_key(new_file_key, chunk_index)?;
+        self.persist_chunk(chunk_hash, chunk_index, &plaintext, &new_chunk_key)
+            .await?;
+
+        // 4. Shadow the old shards' on-backend ciphertext for GC, and
+        // delete the now-stale shard *records* from metadata so they
+        // don't show up under scrub. We deliberately do NOT delete the
+        // ciphertext on the backend synchronously here — the `RepairWorker`
+        // / shadow-sweep tier owns that, and it's the only path that
+        // knows how to honor per-plugin idempotency rules and quota.
+        let mut txn = Txn::new();
+        let now = Timestamp::from_string(now_iso());
+        for s in &old_shards {
+            // Skip Pending/Failed placeholders — they have empty handles
+            // and no real on-backend bytes to shadow.
+            if matches!(s.ack_state, AckState::Acked) {
+                let shadow = os_entities::Shadow {
+                    shadow_id: os_types::ShadowId::new_v7(),
+                    original_chunk_hash: chunk_hash,
+                    driver_id: s.driver_id.value,
+                    native_handle: s.native_handle.value.clone(),
+                    ciphertext_length: s.ciphertext_length,
+                    abandoned_at: now.clone(),
+                    reason: os_entities::ShadowReason::KeyRevoked,
+                    cached_elsewhere_risk: os_types::CachedElsewhereRisk::High,
+                    counts_against_quota: true,
+                    tombstone_clears_at: None,
+                    state: os_entities::ShadowState::Registered,
+                    peek_count: 0,
+                };
+                self.store.put_shadow(&mut txn, &shadow)?;
+            }
+            // The new shards `persist_chunk` wrote use fresh `ShardId`s,
+            // so the old `ShardId`s are now orphaned in the Shards CF.
+            // Drop them. (If a new shard happened to collide on `shard_id`
+            // — astronomically unlikely with v7 UUIDs — `persist_chunk`'s
+            // own put would overwrite it, and we'd be deleting our own
+            // freshly-written record. Guard against it.)
+            let still_referenced =
+                self.store.get_chunk(chunk_hash)?.map_or(false, |c| {
+                    c.shard_list.iter().any(|sid| *sid == s.shard_id)
+                });
+            if !still_referenced {
+                txn.delete(
+                    os_metadata::ColumnFamily::Shards,
+                    s.shard_id.as_bytes().to_vec(),
+                );
+            }
+        }
+        self.store.commit(txn)?;
+        Ok(())
     }
 
     /// Read the current `file_key_version` for a file. Used by sharing to

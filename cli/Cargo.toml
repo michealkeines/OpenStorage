@@ -52,3 +52,5 @@ os-types = { path = "../src/types" }
 os-vault = { path = "../src/vault" }
 os-vfs = { path = "../src/vfs" }
 os-wal = { path = "../src/wal" }
+os-chunk = { path = "../src/chunk" }
+hex = { workspace = true }
